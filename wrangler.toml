@@ -6,7 +6,7 @@ compatibility_flags = ["global_fetch_strictly_public"]
 # KV namespace for OAuth tokens and state
 [[kv_namespaces]]
 binding = "OAUTH_KV"
-id = "YOUR_KV_NAMESPACE_ID"
+id = "1a64a2ae2ec14781bf78f30bed336e07"
 
 # Optional: in-Worker rate limiting backstop
 [[ratelimits]]
