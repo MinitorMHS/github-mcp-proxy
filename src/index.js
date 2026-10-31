@@ -43,7 +43,6 @@ async function decryptToken(encoded, keyB64) {
 // ============================================================
 const mcpApiHandler = {
   async fetch(request, env, ctx) {
-    // Decrypt the GitHub token that was stored encrypted in props
     const encryptedToken = ctx.props?.encryptedGithubToken;
     if (!encryptedToken) {
       return new Response('Missing upstream token', { status: 401 });
@@ -101,7 +100,7 @@ const oauthHandler = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ---- Rate limit /oauth/register to prevent DCR spam ----
+    // Rate limit /oauth/register to prevent DCR spam
     if (url.pathname === '/oauth/register' && env.REG_RL) {
       const { success } = await env.REG_RL.limit({
         key: request.headers.get('CF-Connecting-IP') || 'unknown',
@@ -136,16 +135,33 @@ const oauthHandler = {
         return new Response('GITHUB_CLIENT_ID not configured', { status: 500 });
       }
 
+      // Store the parsed authRequest for the callback step
       await env.OAUTH_KV.put(
         `authreq:${authRequest.state}`,
         JSON.stringify(authRequest),
         { expirationTtl: 600 }
       );
 
+      // Request all scopes the official GitHub MCP server advertises.
+      // GitHub will only grant scopes the OAuth App is allowed to request;
+      // any org-restricted scope may remain "pending" until an admin approves.
+      const GITHUB_SCOPES = [
+        'repo',
+        'read:org',
+        'read:user',
+        'user:email',
+        'read:packages',
+        'write:packages',
+        'read:project',
+        'project',
+        'gist',
+        'notifications',
+      ].join(' ');
+
       const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
       githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
       githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
-      githubAuthUrl.searchParams.set('scope', 'repo user:email');
+      githubAuthUrl.searchParams.set('scope', GITHUB_SCOPES);
       githubAuthUrl.searchParams.set('state', authRequest.state);
 
       return Response.redirect(githubAuthUrl.toString(), 302);
@@ -192,7 +208,12 @@ const oauthHandler = {
         return new Response(`GitHub token exchange failed: ${escapeHtml(desc)}`, { status: 502 });
       }
 
-      // Encrypt the GitHub token before it goes into KV via props
+      // Log the scopes GitHub actually granted (useful for debugging)
+      if (tokenData.scope) {
+        console.log('GitHub granted scopes:', tokenData.scope);
+      }
+
+      // Encrypt the GitHub token before storing in KV via props
       let encryptedGithubToken;
       try {
         encryptedGithubToken = await encryptToken(
@@ -210,7 +231,7 @@ const oauthHandler = {
           userId: 'github-user',
           metadata: {},
           scope: authRequest.scope,
-          props: { encryptedGithubToken },  // encrypted, not plaintext
+          props: { encryptedGithubToken },
         });
 
         await env.OAUTH_KV.delete(`authreq:${state}`);
@@ -238,7 +259,6 @@ async function cleanupHandler(env) {
   do {
     const list = await env.OAUTH_KV.list({ prefix: 'authreq:', cursor });
     for (const key of list.keys) {
-      // If the record is empty/missing it's expired
       const val = await env.OAUTH_KV.get(key.name);
       if (!val) {
         await env.OAUTH_KV.delete(key.name);
@@ -248,7 +268,7 @@ async function cleanupHandler(env) {
     cursor = list.list_complete ? undefined : list.cursor;
   } while (cursor);
 
-  // 2. Orphaned DCR clients (registered but never used for a grant)
+  // 2. Orphaned DCR clients (only if the library exposes expiresAt)
   const clients = await env.OAUTH_KV.list({ prefix: '__client:' });
   const grants = await env.OAUTH_KV.list({ prefix: '__grant:' });
 
@@ -260,14 +280,14 @@ async function cleanupHandler(env) {
 
   for (const c of clients.keys) {
     const client = await env.OAUTH_KV.get(c.name, 'json');
-    // Only delete clients with no grant AND no timestamp marker we set
-    // (skip if the library has no createdAt — safer to leave them)
-    if (client?.clientId && !grantedClientIds.has(client.clientId)) {
-      // Conservative: only delete if the client object has an expiresAt in the past
-      if (client.expiresAt && client.expiresAt < Date.now()) {
-        await env.OAUTH_KV.delete(c.name);
-        deleted++;
-      }
+    if (
+      client?.clientId &&
+      !grantedClientIds.has(client.clientId) &&
+      client.expiresAt &&
+      client.expiresAt < Date.now()
+    ) {
+      await env.OAUTH_KV.delete(c.name);
+      deleted++;
     }
   }
 
@@ -275,7 +295,7 @@ async function cleanupHandler(env) {
 }
 
 // ============================================================
-// 5. Exports
+// 5. OAuthProvider + Worker exports
 // ============================================================
 const provider = new OAuthProvider({
   apiRoute: '/mcp',
