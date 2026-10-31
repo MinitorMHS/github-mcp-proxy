@@ -9,7 +9,13 @@ preview_urls = false
 binding = "OAUTH_KV"
 id = "1a64a2ae2ec14781bf78f30bed336e07"
 
-# Rate limit for MCP API requests
+# Optional settings (secrets are set with `wrangler secret put`, see README):
+# [vars]
+# ALLOWED_GITHUB_USERS = "your-login"     # comma-separated; empty = any GitHub account
+# GITHUB_SCOPES = "repo read:org read:user user:email read:packages write:packages read:project project gist notifications workflow"
+# MCP_LOCKDOWN = "true"                   # ask GitHub to hide public issue content from users without push access
+
+# Rate limit for MCP API requests (keyed per GitHub user)
 [[ratelimits]]
 name = "MCP_RL"
 namespace_id = "1001"
@@ -17,7 +23,7 @@ namespace_id = "1001"
 limit = 60
 period = 60
 
-# Strict rate limit for OAuth registration (DCR spam protection)
+# Strict rate limit for OAuth client registration (DCR spam protection)
 [[ratelimits]]
 name = "REG_RL"
 namespace_id = "1002"
@@ -25,6 +31,6 @@ namespace_id = "1002"
 limit = 5
 period = 60
 
-# Daily cleanup cron
+# Daily KV sweep (expired grants / orphaned tokens)
 [triggers]
 crons = ["0 3 * * *"]

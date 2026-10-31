@@ -1,0 +1,4 @@
+GITHUB_CLIENT_ID=your_oauth_app_client_id
+GITHUB_CLIENT_SECRET=your_oauth_app_client_secret
+# openssl rand -base64 32
+ENCRYPTION_KEY=

@@ -1,4 +1,40 @@
-import { OAuthProvider, AuthorizationError } from '@cloudflare/workers-oauth-provider';
+import {
+  OAuthProvider,
+  AuthorizationError,
+  OAuthError,
+  authorizationErrorRedirect,
+  getOAuthApi,
+} from '@cloudflare/workers-oauth-provider';
+
+// ============================================================
+// 0. Configuration
+// ============================================================
+
+// Public origin this Worker is served from. Must match the custom domain you
+// attach to the Worker and the callback URL on your GitHub OAuth App.
+const PUBLIC_ORIGIN = 'https://github.miix.ir';
+const MCP_PATH = '/mcp';
+
+const TARGET_HOST = 'api.githubcopilot.com';
+const GITHUB_UA = 'github-mcp-proxy';
+
+// Scopes this proxy hands to MCP clients.
+//   mcp:read       - required for every connection
+//   mcp:write      - without it the proxy forces GitHub's read-only mode
+//   offline_access - lets clients keep a refresh token
+const SCOPES_SUPPORTED = ['mcp:read', 'mcp:write', 'offline_access'];
+
+// Same default set GitHub documents for its own MCP server. Override with the
+// GITHUB_SCOPES var (space separated) to add e.g. `workflow`.
+const DEFAULT_GITHUB_SCOPES =
+  'repo read:org read:user user:email read:packages write:packages read:project project gist notifications';
+
+const ACCESS_TOKEN_TTL = 3600; // seconds, proxy-issued access tokens
+const DCR_CLIENT_TTL = 60 * 60 * 24 * 90; // seconds, dynamically registered clients
+// Refresh the upstream GitHub token when less than this remains (GitHub App
+// user tokens expire after 8h; OAuth App tokens never expire).
+const UPSTREAM_REFRESH_WINDOW_MS = (ACCESS_TOKEN_TTL + 900) * 1000;
+const PURGE_CURSOR_KEY = 'purge:cursor';
 
 // ============================================================
 // 1. Encryption helpers (AES-256-GCM)
@@ -39,80 +75,251 @@ async function decryptToken(encoded, keyB64) {
 }
 
 // ============================================================
-// 2. API handler (resource server): proxies to GitHub MCP
+// 2. GitHub helpers
 // ============================================================
+function b64url(bytes) {
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+// PKCE (S256) for the proxy -> GitHub leg.
+async function pkcePair() {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return { verifier, challenge: b64url(new Uint8Array(digest)) };
+}
+
+function githubTokenRequest(env, params) {
+  return fetch('https://github.com/login/oauth/access_token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'User-Agent': GITHUB_UA,
+    },
+    body: JSON.stringify({
+      client_id: env.GITHUB_CLIENT_ID,
+      client_secret: env.GITHUB_CLIENT_SECRET,
+      ...params,
+    }),
+  });
+}
+
+function githubUserRequest(token) {
+  return fetch('https://api.github.com/user', {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': GITHUB_UA,
+    },
+  });
+}
+
+// Turns GitHub's token response into the props we persist (tokens encrypted).
+async function buildProps(env, tokenData, login) {
+  const props = {
+    encryptedGithubToken: await encryptToken(tokenData.access_token, env.ENCRYPTION_KEY),
+    login,
+  };
+  // Present only for GitHub Apps with expiring user tokens.
+  if (tokenData.refresh_token) {
+    props.encryptedRefreshToken = await encryptToken(tokenData.refresh_token, env.ENCRYPTION_KEY);
+  }
+  if (tokenData.expires_in) {
+    props.upstreamExpiresAt = Date.now() + Number(tokenData.expires_in) * 1000;
+  }
+  return props;
+}
+
+// Refreshes an expiring GitHub token during a proxy refresh-token exchange.
+async function refreshUpstream(env, props, grantId, userId) {
+  const transient = (description) =>
+    new OAuthError('temporarily_unavailable', {
+      description,
+      statusCode: 503,
+      headers: { 'Retry-After': '30' },
+    });
+
+  let refreshToken;
+  try {
+    refreshToken = await decryptToken(props.encryptedRefreshToken, env.ENCRYPTION_KEY);
+  } catch (err) {
+    console.error('Refresh token decryption failed', err.message);
+    throw new OAuthError('server_error', { description: 'Stored credentials unreadable', statusCode: 500 });
+  }
+
+  let resp;
+  try {
+    resp = await githubTokenRequest(env, { grant_type: 'refresh_token', refresh_token: refreshToken });
+  } catch {
+    throw transient('GitHub is unreachable; retry shortly');
+  }
+  if (resp.status >= 500) throw transient('GitHub is unavailable; retry shortly');
+
+  const data = await resp.json().catch(() => ({}));
+  if (!data.access_token) {
+    // GitHub answers HTTP 200 with an `error` field.
+    if (data.error === 'bad_refresh_token' || data.error === 'invalid_grant') {
+      await getOAuthApi(providerOptions, env).revokeGrant(grantId, userId);
+      throw new OAuthError('invalid_grant', {
+        description: 'GitHub authorization expired; reconnect to authorize again',
+      });
+    }
+    console.error('Upstream refresh failed:', data.error || resp.status);
+    throw new OAuthError('server_error', { description: 'Upstream token refresh failed', statusCode: 502 });
+  }
+
+  const fresh = await buildProps(env, data, props.login);
+  return { ...props, ...fresh };
+}
+
+// ============================================================
+// 3. Token exchange callback (runs on code + refresh exchanges)
+// ============================================================
+async function tokenExchangeCallback(opts) {
+  const { env, grantType, grantId, userId, requestedScope } = opts;
+
+  // grantId/userId let the API handler revoke the grant if GitHub rejects the token.
+  let props = { ...opts.props, grantId, userId };
+
+  if (
+    grantType === 'refresh_token' &&
+    props.encryptedRefreshToken &&
+    props.upstreamExpiresAt &&
+    props.upstreamExpiresAt - Date.now() < UPSTREAM_REFRESH_WINDOW_MS
+  ) {
+    props = await refreshUpstream(env, props, grantId, userId);
+  }
+
+  const result = {
+    newProps: props, // persisted on the grant (carries rotated upstream tokens)
+    // Per-token flag derived from the scopes this token actually carries.
+    accessTokenProps: { ...props, canWrite: requestedScope.includes('mcp:write') },
+  };
+
+  if (props.upstreamExpiresAt) {
+    const remaining = Math.floor((props.upstreamExpiresAt - Date.now()) / 1000) - 60;
+    result.accessTokenTTL = Math.max(60, Math.min(ACCESS_TOKEN_TTL, remaining));
+  }
+  return result;
+}
+
+// ============================================================
+// 4. API handler (resource server): proxies to GitHub MCP
+// ============================================================
+const RESOURCE_METADATA_URL = `${PUBLIC_ORIGIN}/.well-known/oauth-protected-resource${MCP_PATH}`;
+
 const mcpApiHandler = {
   async fetch(request, env, ctx) {
-    const encryptedToken = ctx.props?.encryptedGithubToken;
-    if (!encryptedToken) {
+    const props = ctx.props || {};
+    if (!props.encryptedGithubToken) {
       return new Response('Missing upstream token', { status: 401 });
+    }
+
+    // Rate limit per authenticated user (falls back to IP for legacy grants).
+    // IP keys would lump together every client behind a shared egress address.
+    if (env.MCP_RL) {
+      const key = props.userId || request.headers.get('CF-Connecting-IP') || 'unknown';
+      const { success } = await env.MCP_RL.limit({ key });
+      if (!success) return new Response('Rate limited', { status: 429, headers: { 'Retry-After': '60' } });
     }
 
     let upstreamToken;
     try {
-      upstreamToken = await decryptToken(encryptedToken, env.ENCRYPTION_KEY);
+      upstreamToken = await decryptToken(props.encryptedGithubToken, env.ENCRYPTION_KEY);
     } catch (err) {
       console.error('Token decryption failed', err.message);
       return new Response('Token decryption failed', { status: 500 });
     }
 
-    if (env.MCP_RL) {
-      const { success } = await env.MCP_RL.limit({
-        key: request.headers.get('CF-Connecting-IP') || 'unknown',
-      });
-      if (!success) return new Response('Rate limited', { status: 429 });
-    }
-
-    const TARGET_HOST = 'api.githubcopilot.com';
     const url = new URL(request.url);
     const targetUrl = new URL(`https://${TARGET_HOST}${url.pathname}${url.search}`);
 
-    const proxyRequest = new Request(targetUrl, {
-      method: request.method,
-      headers: request.headers,
-      body: request.body,
-      redirect: 'manual',
-    });
-
-    proxyRequest.headers.set('Host', TARGET_HOST);
-    proxyRequest.headers.set('Authorization', `Bearer ${upstreamToken}`);
-
+    const headers = new Headers(request.headers);
+    headers.set('Authorization', `Bearer ${upstreamToken}`);
     for (const h of [
-      'CF-Connecting-IP', 'X-Forwarded-For', 'CF-Connecting-Port',
+      'Cookie', 'CF-Connecting-IP', 'X-Forwarded-For', 'CF-Connecting-Port',
       'CF-EW-Via', 'CF-Ray', 'X-Forwarded-Proto', 'X-Real-IP',
     ]) {
-      proxyRequest.headers.delete(h);
+      headers.delete(h);
     }
 
-    const response = await fetch(proxyRequest);
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
+    // mcp:write is enforced here: without it GitHub's server only exposes read tools.
+    // Tokens issued before this logic existed have no canWrite flag, so they stay
+    // read-only until their next refresh.
+    if (props.canWrite !== true) headers.set('X-MCP-Readonly', 'true');
+    if (env.MCP_LOCKDOWN === 'true') headers.set('X-MCP-Lockdown', 'true');
+
+    const upstream = await fetch(
+      new Request(targetUrl, {
+        method: request.method,
+        headers,
+        body: request.body,
+        redirect: 'manual',
+      })
+    );
+
+    // GitHub rejected the stored token. Only treat it as dead if the REST API agrees,
+    // then revoke the grant so the client is forced through a fresh authorization
+    // instead of refreshing proxy tokens forever.
+    if (upstream.status === 401) {
+      let dead = false;
+      try {
+        dead = (await githubUserRequest(upstreamToken)).status === 401;
+      } catch {
+        // network error: leave the grant alone
+      }
+      if (dead && props.grantId && props.userId) {
+        try {
+          await env.OAUTH_PROVIDER.revokeGrant(props.grantId, props.userId);
+        } catch (err) {
+          console.error('revokeGrant failed', err.message);
+        }
+      }
+      return new Response('GitHub rejected the stored token. Reconnect to authorize again.', {
+        status: 401,
+        headers: {
+          'WWW-Authenticate': `Bearer error="invalid_token", error_description="GitHub token rejected", resource_metadata="${RESOURCE_METADATA_URL}"`,
+        },
+      });
+    }
+
+    const responseHeaders = new Headers(upstream.headers);
+    if (upstream.status === 403) {
+      // GitHub's remote server answers missing OAuth scopes with a challenge that
+      // points the client at GitHub. Clients can't step up through this proxy, so
+      // drop the challenge and log what is missing (add it via GITHUB_SCOPES).
+      const challenge = responseHeaders.get('WWW-Authenticate');
+      if (challenge && /insufficient_scope/i.test(challenge)) {
+        console.warn('GitHub scope challenge:', challenge);
+        responseHeaders.delete('WWW-Authenticate');
+      }
+    }
+
+    return new Response(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: responseHeaders,
     });
   },
 };
 
 // ============================================================
-// 3. OAuth handler
+// 5. OAuth handler (consent -> GitHub -> callback)
 // ============================================================
 const oauthHandler = {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
+    const helpers = env.OAUTH_PROVIDER;
 
-    // Rate limit /oauth/register to prevent DCR spam
-    if (url.pathname === '/oauth/register' && env.REG_RL) {
-      const { success } = await env.REG_RL.limit({
-        key: request.headers.get('CF-Connecting-IP') || 'unknown',
-      });
-      if (!success) return new Response('Rate limited', { status: 429 });
-    }
-
-    // ---- GET /authorize ----
+    // ---- GET /authorize: show consent page ----
     if (request.method === 'GET' && url.pathname === '/authorize') {
       let authRequest;
       try {
-        authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+        authRequest = await helpers.parseAuthRequest(request);
       } catch (error) {
         if (error instanceof AuthorizationError) {
           if (error.redirectUri) {
@@ -123,124 +330,139 @@ const oauthHandler = {
             if (error.issuer) redirect.searchParams.set('iss', error.issuer);
             return Response.redirect(redirect.toString(), 302);
           }
-          return new Response(
-            `<h1>Authorization Error</h1><p>${escapeHtml(error.description || 'Unknown error')}</p>`,
-            { status: 400, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
-          );
+          return errorPage(400, error.description || 'Unknown error');
         }
         throw error;
       }
 
-      if (!env.GITHUB_CLIENT_ID) {
-        return new Response('GITHUB_CLIENT_ID not configured', { status: 500 });
+      if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET || !env.ENCRYPTION_KEY) {
+        console.error('Missing GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET or ENCRYPTION_KEY');
+        return errorPage(500, 'This server is not configured yet.');
       }
 
-      // Store the parsed authRequest for the callback step
-      await env.OAUTH_KV.put(
-        `authreq:${authRequest.state}`,
-        JSON.stringify(authRequest),
-        { expirationTtl: 600 }
-      );
-
-      // Request all scopes the official GitHub MCP server advertises.
-      // GitHub will only grant scopes the OAuth App is allowed to request;
-      // any org-restricted scope may remain "pending" until an admin approves.
-      const GITHUB_SCOPES = [
-        'repo',
-        'read:org',
-        'read:user',
-        'user:email',
-        'read:packages',
-        'write:packages',
-        'read:project',
-        'project',
-        'gist',
-        'notifications',
-      ].join(' ');
-
-      const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
-      githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
-      githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
-      githubAuthUrl.searchParams.set('scope', GITHUB_SCOPES);
-      githubAuthUrl.searchParams.set('state', authRequest.state);
-
-      return Response.redirect(githubAuthUrl.toString(), 302);
+      const description = await helpers.describeConsent(authRequest);
+      const consent = await helpers.beginConsent(authRequest);
+      return consentPage(description, consent, authRequest.scope.includes('mcp:write'));
     }
 
-    // ---- GET /callback ----
+    // ---- POST /authorize: consent decision -> redirect to GitHub ----
+    if (request.method === 'POST' && url.pathname === '/authorize') {
+      let form;
+      try {
+        form = await request.formData();
+      } catch {
+        return errorPage(400, 'Invalid form submission.');
+      }
+      const handle = form.get('handle');
+      if (typeof handle !== 'string' || !handle) return errorPage(400, 'Missing consent handle.');
+
+      try {
+        if (form.get('action') !== 'approve') {
+          const denied = await helpers.denyConsent(request, handle);
+          return new Response(null, { status: 302, headers: denied.headers });
+        }
+
+        const approved = await helpers.approveConsent(request, handle);
+        const scope = approvedScopes(approved.request.scope, form.get('access') === 'write');
+        const authRequest = { ...approved.request, scope };
+
+        const pkce = await pkcePair();
+        const upstream = await helpers.beginUpstream(authRequest, {
+          data: { codeVerifier: pkce.verifier },
+          headers: approved.headers,
+        });
+
+        const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
+        githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
+        githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
+        githubAuthUrl.searchParams.set('scope', env.GITHUB_SCOPES || DEFAULT_GITHUB_SCOPES);
+        githubAuthUrl.searchParams.set('state', upstream.state);
+        githubAuthUrl.searchParams.set('code_challenge', pkce.challenge);
+        githubAuthUrl.searchParams.set('code_challenge_method', 'S256');
+        return redirectWith(upstream.headers, githubAuthUrl.toString());
+      } catch (error) {
+        if (error instanceof AuthorizationError) {
+          return errorPage(400, 'This authorization request expired or was already used. Start again from your MCP client.');
+        }
+        throw error;
+      }
+    }
+
+    // ---- GET /callback: GitHub redirects back here ----
     if (request.method === 'GET' && url.pathname === '/callback') {
+      let resumed;
+      try {
+        resumed = await helpers.finishUpstream(request);
+      } catch (error) {
+        if (error instanceof AuthorizationError) {
+          return errorPage(400, 'Authorization request expired, was already used, or belongs to a different browser. Start again from your MCP client.');
+        }
+        throw error;
+      }
+      const { request: authRequest, data, headers } = resumed;
+      const fail = (code, description) =>
+        redirectWith(headers, authorizationErrorRedirect(authRequest, code, description));
+
+      const ghError = url.searchParams.get('error');
+      if (ghError) {
+        console.warn('GitHub authorization error:', ghError);
+        return fail(ghError === 'access_denied' ? 'access_denied' : 'server_error', 'GitHub authorization was not completed');
+      }
       const code = url.searchParams.get('code');
-      const state = url.searchParams.get('state');
-      const error = url.searchParams.get('error');
+      if (!code) return fail('invalid_request', 'GitHub did not return a code');
 
-      if (error) {
-        const desc = url.searchParams.get('error_description') || error;
-        return new Response(`GitHub auth error: ${escapeHtml(desc)}`, { status: 400 });
-      }
-      if (!code || !state) {
-        return new Response('Missing code or state', { status: 400 });
-      }
-
-      const stored = await env.OAUTH_KV.get(`authreq:${state}`);
-      if (!stored) {
-        return new Response('Authorization request expired or invalid state', { status: 400 });
-      }
-      const authRequest = JSON.parse(stored);
-
-      const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({
-          client_id: env.GITHUB_CLIENT_ID,
-          client_secret: env.GITHUB_CLIENT_SECRET,
+      let tokenResp;
+      try {
+        tokenResp = await githubTokenRequest(env, {
           code,
           redirect_uri: `${url.origin}/callback`,
-        }),
-      });
-
-      if (!tokenResp.ok) {
-        return new Response('GitHub token exchange HTTP error', { status: 502 });
-      }
-
-      const tokenData = await tokenResp.json();
-      if (!tokenData.access_token) {
-        const desc = tokenData.error_description || tokenData.error || 'unknown';
-        return new Response(`GitHub token exchange failed: ${escapeHtml(desc)}`, { status: 502 });
-      }
-
-      // Log the scopes GitHub actually granted (useful for debugging)
-      if (tokenData.scope) {
-        console.log('GitHub granted scopes:', tokenData.scope);
-      }
-
-      // Encrypt the GitHub token before storing in KV via props
-      let encryptedGithubToken;
-      try {
-        encryptedGithubToken = await encryptToken(
-          tokenData.access_token,
-          env.ENCRYPTION_KEY
-        );
-      } catch (err) {
-        console.error('Token encryption failed', err.message);
-        return new Response('Token encryption failed', { status: 500 });
-      }
-
-      try {
-        const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-          request: authRequest,
-          userId: 'github-user',
-          metadata: {},
-          scope: authRequest.scope,
-          props: { encryptedGithubToken },
+          code_verifier: data?.codeVerifier,
         });
+      } catch {
+        return fail('temporarily_unavailable', 'Could not reach GitHub');
+      }
+      if (!tokenResp.ok) return fail('server_error', `GitHub token exchange failed (HTTP ${tokenResp.status})`);
 
-        await env.OAUTH_KV.delete(`authreq:${state}`);
-        return Response.redirect(redirectTo, 302);
+      const tokenData = await tokenResp.json().catch(() => ({}));
+      if (!tokenData.access_token) {
+        console.error('GitHub token exchange failed:', tokenData.error);
+        return fail('server_error', 'GitHub token exchange failed');
+      }
+      if (tokenData.scope) console.log('GitHub granted scopes:', tokenData.scope);
+
+      // Identify the real GitHub user: becomes the grant's userId so different
+      // accounts never share (or revoke) each other's grants.
+      let ghUser;
+      try {
+        const userResp = await githubUserRequest(tokenData.access_token);
+        ghUser = userResp.ok ? await userResp.json() : null;
+      } catch {
+        ghUser = null;
+      }
+      if (!ghUser?.id || !ghUser?.login) return fail('server_error', 'Could not read the GitHub profile');
+
+      const allowed = (env.ALLOWED_GITHUB_USERS || '')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+      if (allowed.length > 0 && !allowed.includes(ghUser.login.toLowerCase())) {
+        console.warn('Rejected GitHub user not on ALLOWED_GITHUB_USERS:', ghUser.login);
+        return fail('access_denied', 'This GitHub account is not allowed to use this server');
+      }
+
+      try {
+        const props = await buildProps(env, tokenData, ghUser.login);
+        const { redirectTo } = await helpers.completeAuthorization({
+          request: authRequest,
+          userId: String(ghUser.id),
+          metadata: { login: ghUser.login },
+          scope: authRequest.scope,
+          props,
+        });
+        return redirectWith(headers, redirectTo);
       } catch (err) {
         console.error('completeAuthorization failed', err.message);
-        return new Response(`Authorization completion failed: ${escapeHtml(err.message)}`, {
-          status: 500,
-        });
+        return fail('server_error', 'Authorization could not be completed');
       }
     }
 
@@ -249,56 +471,35 @@ const oauthHandler = {
 };
 
 // ============================================================
-// 4. Cron cleanup handler (daily 03:00 UTC)
+// 6. Cleanup (daily 03:00 UTC)
 // ============================================================
+// The library already expires DCR clients (clientRegistrationTTL) and gives its
+// KV records TTLs; purgeExpiredData() sweeps whatever those leave behind
+// (grants of expired clients, orphaned tokens) in resumable batches.
 async function cleanupHandler(env) {
-  let deleted = 0;
+  const api = getOAuthApi(providerOptions, env);
+  let cursor = (await env.OAUTH_KV.get(PURGE_CURSOR_KEY)) || undefined;
+  let grants = 0;
+  let tokens = 0;
 
-  // 1. Orphaned authreq entries (belt-and-suspenders; TTL usually handles these)
-  let cursor;
-  do {
-    const list = await env.OAUTH_KV.list({ prefix: 'authreq:', cursor });
-    for (const key of list.keys) {
-      const val = await env.OAUTH_KV.get(key.name);
-      if (!val) {
-        await env.OAUTH_KV.delete(key.name);
-        deleted++;
-      }
-    }
-    cursor = list.list_complete ? undefined : list.cursor;
-  } while (cursor);
-
-  // 2. Orphaned DCR clients (only if the library exposes expiresAt)
-  const clients = await env.OAUTH_KV.list({ prefix: '__client:' });
-  const grants = await env.OAUTH_KV.list({ prefix: '__grant:' });
-
-  const grantedClientIds = new Set();
-  for (const g of grants.keys) {
-    const grant = await env.OAUTH_KV.get(g.name, 'json');
-    if (grant?.clientId) grantedClientIds.add(grant.clientId);
+  for (let i = 0; i < 5; i++) {
+    const r = await api.purgeExpiredData({ batchSize: 50, cursor });
+    grants += r.grantsPurged;
+    tokens += r.tokensPurged;
+    cursor = r.done ? undefined : r.cursor;
+    if (!cursor) break;
   }
 
-  for (const c of clients.keys) {
-    const client = await env.OAUTH_KV.get(c.name, 'json');
-    if (
-      client?.clientId &&
-      !grantedClientIds.has(client.clientId) &&
-      client.expiresAt &&
-      client.expiresAt < Date.now()
-    ) {
-      await env.OAUTH_KV.delete(c.name);
-      deleted++;
-    }
-  }
-
-  console.log(`KV cleanup: deleted ${deleted} orphaned keys`);
+  if (cursor) await env.OAUTH_KV.put(PURGE_CURSOR_KEY, cursor);
+  else await env.OAUTH_KV.delete(PURGE_CURSOR_KEY);
+  console.log(`KV purge: ${grants} grants, ${tokens} tokens${cursor ? ' (sweep continues next run)' : ''}`);
 }
 
 // ============================================================
-// 5. OAuthProvider + Worker exports
+// 7. OAuthProvider + Worker exports
 // ============================================================
-const provider = new OAuthProvider({
-  apiRoute: '/mcp',
+const providerOptions = {
+  apiRoute: MCP_PATH,
   apiHandler: mcpApiHandler,
   defaultHandler: oauthHandler,
 
@@ -306,19 +507,34 @@ const provider = new OAuthProvider({
   tokenEndpoint: '/oauth/token',
   clientRegistrationEndpoint: '/oauth/register',
 
-  scopesSupported: ['mcp:read', 'mcp:write', 'offline_access'],
+  scopesSupported: SCOPES_SUPPORTED,
   resourceMetadata: {
-    resource: 'https://github.miix.ir/mcp',
-    authorization_servers: ['https://github.miix.ir'],
+    resource: `${PUBLIC_ORIGIN}${MCP_PATH}`,
+    authorization_servers: [PUBLIC_ORIGIN],
   },
   requiredScopes: ['mcp:read'],
 
+  accessTokenTTL: ACCESS_TOKEN_TTL,
+  clientRegistrationTTL: DCR_CLIENT_TTL,
+  tokenExchangeCallback,
+
   clientIdMetadataDocumentEnabled: false,
   kv: (env) => env.OAUTH_KV,
-});
+};
+
+const provider = new OAuthProvider(providerOptions);
 
 export default {
   async fetch(request, env, ctx) {
+    // The library serves /oauth/register itself and never hands it to a custom
+    // handler, so the DCR spam limit has to sit in front of it.
+    const url = new URL(request.url);
+    if (request.method === 'POST' && url.pathname === '/oauth/register' && env.REG_RL) {
+      const { success } = await env.REG_RL.limit({
+        key: request.headers.get('CF-Connecting-IP') || 'unknown',
+      });
+      if (!success) return new Response('Rate limited', { status: 429, headers: { 'Retry-After': '60' } });
+    }
     return provider.fetch(request, env, ctx);
   },
   async scheduled(event, env, ctx) {
@@ -327,11 +543,88 @@ export default {
 };
 
 // ============================================================
-// 6. Helpers
+// 8. Helpers
 // ============================================================
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;',
     '"': '&quot;', "'": '&#39;',
   }[c]));
+}
+
+// Final scope set: always mcp:read, mcp:write only if the user chose it.
+function approvedScopes(requested, write) {
+  const scopes = new Set(
+    requested.filter((s) => SCOPES_SUPPORTED.includes(s) && s !== 'mcp:write')
+  );
+  scopes.add('mcp:read');
+  if (write) scopes.add('mcp:write');
+  return [...scopes];
+}
+
+function redirectWith(baseHeaders, location) {
+  const headers = new Headers(baseHeaders);
+  headers.set('Location', location);
+  return new Response(null, { status: 302, headers });
+}
+
+function htmlPage(title, body, status = 200, baseHeaders) {
+  const headers = new Headers(baseHeaders);
+  headers.set('Content-Type', 'text/html; charset=utf-8');
+  headers.set(
+    'Content-Security-Policy',
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+  );
+  headers.set('X-Frame-Options', 'DENY');
+  headers.set('Cache-Control', 'no-store');
+  const doc = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>${escapeHtml(title)}</title>
+<style>
+  body{font:16px/1.5 system-ui,sans-serif;max-width:30rem;margin:3rem auto;padding:0 1rem}
+  h1{font-size:1.3rem}
+  .box{border:1px solid color-mix(in srgb,currentColor 25%,transparent);border-radius:.6rem;padding:1rem;margin:1rem 0}
+  .warn{border-color:#c0392b;color:#c0392b}
+  label{display:block;margin:.5rem 0;cursor:pointer}
+  code{background:color-mix(in srgb,currentColor 12%,transparent);padding:.1rem .3rem;border-radius:.25rem;word-break:break-all}
+  .row{display:flex;gap:.75rem;margin-top:1.25rem}
+  button{flex:1;font:inherit;padding:.65rem;border-radius:.5rem;border:1px solid currentColor;cursor:pointer;background:transparent;color:inherit}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+</style></head><body>${body}</body></html>`;
+  return new Response(doc, { status, headers });
+}
+
+function errorPage(status, message) {
+  return htmlPage('Authorization error', `<h1>Authorization error</h1><p>${escapeHtml(message)}</p>`, status);
+}
+
+function consentPage(desc, consent, clientWantsWrite) {
+  const warnLoopback = desc.redirectIsLoopback
+    ? `<div class="box warn"><strong>Local app.</strong> The tokens go to a program on this device. Any local process could be listening, whatever name it claims.</div>`
+    : '';
+  const verified = desc.clientDomain
+    ? `<p>Verified domain: <code>${escapeHtml(desc.clientDomain)}</code></p>`
+    : `<p><small>The name above is self-reported by the client and not verified.</small></p>`;
+  const body = `<h1>Connect to GitHub</h1>
+<div class="box">
+  <p><strong>${escapeHtml(desc.clientName)}</strong> wants to use your GitHub account through this proxy.</p>
+  ${verified}
+  <p>After you approve, access tokens are sent to:<br><code>${escapeHtml(desc.redirectHost)}</code></p>
+</div>
+${warnLoopback}
+<form method="post" action="/authorize">
+  <input type="hidden" name="handle" value="${escapeHtml(consent.handle)}">
+  <div class="box">
+    <strong>Access level</strong>
+    <label><input type="radio" name="access" value="read"${clientWantsWrite ? '' : ' checked'}> Read-only: browse repos, issues, pull requests</label>
+    <label><input type="radio" name="access" value="write"${clientWantsWrite ? ' checked' : ''}> Read &amp; write: also create, edit and merge</label>
+  </div>
+  <p><small>You will sign in to GitHub next. Only approve clients you set up yourself.</small></p>
+  <div class="row">
+    <button type="submit" name="action" value="deny">Deny</button>
+    <button type="submit" name="action" value="approve" class="primary">Approve</button>
+  </div>
+</form>`;
+  return htmlPage('Connect to GitHub', body, 200, consent.headers);
 }
