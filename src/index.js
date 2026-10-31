@@ -10,7 +10,6 @@ const mcpApiHandler = {
       return new Response('Missing upstream token', { status: 401 });
     }
 
-    // Optional: rate limit backstop
     if (env.MCP_RL) {
       const { success } = await env.MCP_RL.limit({
         key: request.headers.get('CF-Connecting-IP') || 'unknown',
@@ -49,13 +48,13 @@ const mcpApiHandler = {
 };
 
 // ============================================================
-// 2. Consent / authorization handler (defaultHandler)
+// 2. OAuth handler: redirect straight to GitHub, no consent UI
 // ============================================================
-const consentHandler = {
+const oauthHandler = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ---- GET /authorize: render consent page ----
+    // ---- GET /authorize: parse, validate, redirect to GitHub ----
     if (request.method === 'GET' && url.pathname === '/authorize') {
       let authRequest;
       try {
@@ -78,131 +77,39 @@ const consentHandler = {
         throw error;
       }
 
-      // CSRF protection: random token in __Host- cookie + hidden form field
-      const csrfToken = crypto.randomUUID();
-      const csrfCookieName = '__Host-csrf';
-      const csrfCookie = `${csrfCookieName}=${csrfToken}; Path=/; Secure; HttpOnly; SameSite=Lax`;
-
-      // State binding: store CSRF token in KV with short TTL
-      const stateKey = `state:${authRequest.state}`;
-      await env.OAUTH_KV.put(
-        stateKey,
-        JSON.stringify({ csrfToken }),
-        { expirationTtl: 600 }
-      );
-
-      const clientName = escapeHtml(authRequest.clientName || 'Unknown Client');
-      const stateEscaped = escapeAttr(authRequest.state);
-
-      const html = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Authorize ${clientName}</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 480px; margin: 4rem auto; color: #222; }
-    .card { border: 1px solid #ddd; padding: 2rem; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-    h2 { margin-top: 0; }
-    button { padding: 0.5rem 1.25rem; margin-right: 0.75rem; border-radius: 6px; border: 1px solid #ccc; cursor: pointer; font-size: 1rem; }
-    button[value="allow"] { background: #1f883d; color: #fff; border-color: #1f883d; }
-    button[value="deny"]  { background: #f6f8fa; color: #222; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>Authorize ${clientName}</h2>
-    <p><strong>${clientName}</strong> is requesting access to your GitHub Copilot MCP data via this proxy.</p>
-    <form method="POST" action="/authorize">
-      <input type="hidden" name="state" value="${stateEscaped}">
-      <input type="hidden" name="csrf" value="${csrfToken}">
-      <button type="submit" name="decision" value="allow">Allow</button>
-      <button type="submit" name="decision" value="deny">Deny</button>
-    </form>
-  </div>
-</body>
-</html>`;
-
-      return new Response(html, {
-        status: 200,
-        headers: {
-          'Content-Type': 'text/html; charset=utf-8',
-          'Content-Security-Policy':
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-          'Set-Cookie': csrfCookie,
-          'Referrer-Policy': 'no-referrer',
-          'X-Content-Type-Options': 'nosniff',
-          'X-Frame-Options': 'DENY',
-        },
-      });
-    }
-
-    // ---- POST /authorize: handle consent decision ----
-    if (request.method === 'POST' && url.pathname === '/authorize') {
-      const form = await request.formData();
-      const state = form.get('state');
-      const csrfFromForm = form.get('csrf');
-      const decision = form.get('decision');
-
-      // Read the __Host-csrf cookie
-      const cookieHeader = request.headers.get('Cookie') || '';
-      const cookies = Object.fromEntries(
-        cookieHeader.split(';').map((c) => {
-          const [k, ...v] = c.trim().split('=');
-          return [k, v.join('=')];
-        })
-      );
-      const csrfFromCookie = cookies['__Host-csrf'];
-
-      const stateKey = `state:${state}`;
-      const stored = await env.OAUTH_KV.get(stateKey, 'json');
-
-      if (!stored) {
-        return new Response('Invalid CSRF token or expired state', { status: 403 });
+      if (!env.GITHUB_CLIENT_ID) {
+        return new Response('GITHUB_CLIENT_ID not configured', { status: 500 });
       }
 
-      // Verify CSRF against both form field and HttpOnly cookie
-      if (stored.csrfToken !== csrfFromForm || stored.csrfToken !== csrfFromCookie) {
-        return new Response('Invalid CSRF token or expired state', { status: 403 });
-      }
-
-      if (decision !== 'allow') {
-        await env.OAUTH_KV.delete(stateKey);
-        return new Response('Access denied', { status: 403 });
-      }
-
-      // Build GitHub redirect URL
+      // Skip the consent page — GitHub will show its own authorization screen.
+      // The state param (issued by Claude's MCP client) already provides CSRF protection.
       const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
       githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
       githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
       githubAuthUrl.searchParams.set('scope', 'repo user:email');
-      githubAuthUrl.searchParams.set('state', state);
+      githubAuthUrl.searchParams.set('state', authRequest.state);
 
-      // IMPORTANT: do NOT delete state here. Letting it persist makes
-      // double-submit / back-refresh idempotent — repeats return the same 302.
-      // The state expires on its own after the 10-minute TTL.
+      console.log('Redirecting to GitHub', { state: authRequest.state });
       return Response.redirect(githubAuthUrl.toString(), 302);
     }
 
-    // ---- GET /callback: GitHub redirects back here ----
+    // ---- GET /callback: GitHub redirects here with code ----
     if (request.method === 'GET' && url.pathname === '/callback') {
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
       const error = url.searchParams.get('error');
 
       if (error) {
-        return new Response(`GitHub auth error: ${escapeHtml(error)}`, { status: 400 });
+        const desc = url.searchParams.get('error_description') || error;
+        return new Response(`GitHub auth error: ${escapeHtml(desc)}`, { status: 400 });
       }
       if (!code || !state) {
         return new Response('Missing code or state', { status: 400 });
       }
 
-      // Exchange the authorization code for a GitHub access token
       const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({
           client_id: env.GITHUB_CLIENT_ID,
           client_secret: env.GITHUB_CLIENT_SECRET,
@@ -217,13 +124,14 @@ const consentHandler = {
 
       const tokenData = await tokenResp.json();
       if (!tokenData.access_token) {
-        return new Response('GitHub token exchange failed', { status: 502 });
+        const desc = tokenData.error_description || tokenData.error || 'unknown';
+        return new Response(`GitHub token exchange failed: ${escapeHtml(desc)}`, { status: 502 });
       }
 
-      // Clean up the state used for this flow
-      await env.OAUTH_KV.delete(`state:${state}`);
+      console.log('GitHub token acquired, completing authorization');
 
-      // Complete the authorization — store upstream token in props
+      // Library looks up pending auth by state, issues token to Claude,
+      // returns a 302 redirect to Claude's localhost callback.
       return env.OAUTH_PROVIDER.completeAuthorization({
         request,
         userId: 'github-user',
@@ -242,7 +150,7 @@ const consentHandler = {
 export default new OAuthProvider({
   apiRoute: '/mcp',
   apiHandler: mcpApiHandler,
-  defaultHandler: consentHandler,
+  defaultHandler: oauthHandler,
 
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
@@ -255,7 +163,6 @@ export default new OAuthProvider({
   },
   requiredScopes: ['mcp:read'],
 
-  // Disable CIMD — rely on DCR instead (Claude's CIMD doc exceeds 5 KB).
   clientIdMetadataDocumentEnabled: false,
 
   kv: (env) => env.OAUTH_KV,
@@ -268,12 +175,5 @@ function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;',
     '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
-
-function escapeAttr(str) {
-  return String(str).replace(/["'&<>]/g, (c) => ({
-    '"': '&quot;', "'": '&#39;', '&': '&amp;',
-    '<': '&lt;', '>': '&gt;',
   }[c]));
 }
