@@ -48,13 +48,13 @@ const mcpApiHandler = {
 };
 
 // ============================================================
-// 2. OAuth handler: redirect straight to GitHub, no consent UI
+// 2. OAuth handler: redirect to GitHub, then complete authorization
 // ============================================================
 const oauthHandler = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ---- GET /authorize: parse, validate, redirect to GitHub ----
+    // ---- GET /authorize: validate, store authRequest, redirect to GitHub ----
     if (request.method === 'GET' && url.pathname === '/authorize') {
       let authRequest;
       try {
@@ -81,8 +81,14 @@ const oauthHandler = {
         return new Response('GITHUB_CLIENT_ID not configured', { status: 500 });
       }
 
-      // Skip the consent page — GitHub will show its own authorization screen.
-      // The state param (issued by Claude's MCP client) already provides CSRF protection.
+      // Store the parsed authRequest in KV so the callback can use it.
+      // completeAuthorization() needs the ORIGINAL parsed request, not the callback.
+      await env.OAUTH_KV.put(
+        `authreq:${authRequest.state}`,
+        JSON.stringify(authRequest),
+        { expirationTtl: 600 }
+      );
+
       const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
       githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
       githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
@@ -107,6 +113,14 @@ const oauthHandler = {
         return new Response('Missing code or state', { status: 400 });
       }
 
+      // Retrieve the original parsed authRequest from KV
+      const stored = await env.OAUTH_KV.get(`authreq:${state}`);
+      if (!stored) {
+        return new Response('Authorization request expired or invalid state', { status: 400 });
+      }
+      const authRequest = JSON.parse(stored);
+
+      // Exchange GitHub code for an access token
       const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -130,14 +144,27 @@ const oauthHandler = {
 
       console.log('GitHub token acquired, completing authorization');
 
-      // Library looks up pending auth by state, issues token to Claude,
-      // returns a 302 redirect to Claude's localhost callback.
-      return env.OAUTH_PROVIDER.completeAuthorization({
-        request,
-        userId: 'github-user',
-        scope: ['mcp:read', 'mcp:write'],
-        props: { githubAccessToken: tokenData.access_token },
-      });
+      // completeAuthorization expects the ORIGINAL parsed authRequest.
+      // It returns { redirectTo }, which we must redirect to.
+      try {
+        const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+          request: authRequest,
+          userId: 'github-user',
+          metadata: {},
+          scope: authRequest.scope, // scopes requested by the client
+          props: { githubAccessToken: tokenData.access_token },
+        });
+
+        // Clean up the stored authRequest
+        await env.OAUTH_KV.delete(`authreq:${state}`);
+
+        return Response.redirect(redirectTo, 302);
+      } catch (err) {
+        console.error('completeAuthorization failed', err);
+        return new Response(`Authorization completion failed: ${escapeHtml(err.message)}`, {
+          status: 500,
+        });
+      }
     }
 
     return new Response('Not found', { status: 404 });
