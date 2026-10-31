@@ -247,7 +247,7 @@ const mcpApiHandler = {
       headers.delete(h);
     }
 
-    // mcp:write is enforced here: without it GitHub's server only exposes read tools.
+    // Without mcp:write (READ_ONLY=true) GitHub's server only exposes read tools.
     // Tokens issued before this logic existed have no canWrite flag, so they stay
     // read-only until their next refresh.
     if (props.canWrite !== true) headers.set('X-MCP-Readonly', 'true');
@@ -308,14 +308,14 @@ const mcpApiHandler = {
 };
 
 // ============================================================
-// 5. OAuth handler (consent -> GitHub -> callback)
+// 5. OAuth handler (authorize -> GitHub -> callback)
 // ============================================================
 const oauthHandler = {
   async fetch(request, env) {
     const url = new URL(request.url);
     const helpers = env.OAUTH_PROVIDER;
 
-    // ---- GET /authorize: show consent page ----
+    // ---- GET /authorize: straight through to GitHub (no consent page) ----
     if (request.method === 'GET' && url.pathname === '/authorize') {
       let authRequest;
       try {
@@ -340,52 +340,30 @@ const oauthHandler = {
         return errorPage(500, 'This server is not configured yet.');
       }
 
-      const description = await helpers.describeConsent(authRequest);
-      const consent = await helpers.beginConsent(authRequest);
-      return consentPage(description, consent, authRequest.scope.includes('mcp:write'));
-    }
-
-    // ---- POST /authorize: consent decision -> redirect to GitHub ----
-    if (request.method === 'POST' && url.pathname === '/authorize') {
-      let form;
-      try {
-        form = await request.formData();
-      } catch {
-        return errorPage(400, 'Invalid form submission.');
+      // Without a consent page, the redirect allowlist is what stops someone else's
+      // dynamically registered client from collecting tokens for your GitHub account.
+      console.log('authorize: client', authRequest.clientId, 'redirect_uri', authRequest.redirectUri);
+      if (!redirectAllowed(authRequest.redirectUri, env.ALLOWED_REDIRECT_URIS)) {
+        console.warn('Rejected redirect_uri not on ALLOWED_REDIRECT_URIS:', authRequest.redirectUri);
+        return errorPage(400, 'This client\'s redirect address is not allowed on this server.');
       }
-      const handle = form.get('handle');
-      if (typeof handle !== 'string' || !handle) return errorPage(400, 'Missing consent handle.');
 
-      try {
-        if (form.get('action') !== 'approve') {
-          const denied = await helpers.denyConsent(request, handle);
-          return new Response(null, { status: 302, headers: denied.headers });
-        }
+      // mcp:write is granted unless READ_ONLY=true.
+      const scope = approvedScopes(authRequest.scope, env.READ_ONLY !== 'true');
+      const pkce = await pkcePair();
+      const upstream = await helpers.beginUpstream(
+        { ...authRequest, scope },
+        { data: { codeVerifier: pkce.verifier } }
+      );
 
-        const approved = await helpers.approveConsent(request, handle);
-        const scope = approvedScopes(approved.request.scope, form.get('access') === 'write');
-        const authRequest = { ...approved.request, scope };
-
-        const pkce = await pkcePair();
-        const upstream = await helpers.beginUpstream(authRequest, {
-          data: { codeVerifier: pkce.verifier },
-          headers: approved.headers,
-        });
-
-        const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
-        githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
-        githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
-        githubAuthUrl.searchParams.set('scope', env.GITHUB_SCOPES || DEFAULT_GITHUB_SCOPES);
-        githubAuthUrl.searchParams.set('state', upstream.state);
-        githubAuthUrl.searchParams.set('code_challenge', pkce.challenge);
-        githubAuthUrl.searchParams.set('code_challenge_method', 'S256');
-        return redirectWith(upstream.headers, githubAuthUrl.toString());
-      } catch (error) {
-        if (error instanceof AuthorizationError) {
-          return errorPage(400, 'This authorization request expired or was already used. Start again from your MCP client.');
-        }
-        throw error;
-      }
+      const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
+      githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
+      githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
+      githubAuthUrl.searchParams.set('scope', env.GITHUB_SCOPES || DEFAULT_GITHUB_SCOPES);
+      githubAuthUrl.searchParams.set('state', upstream.state);
+      githubAuthUrl.searchParams.set('code_challenge', pkce.challenge);
+      githubAuthUrl.searchParams.set('code_challenge_method', 'S256');
+      return redirectWith(upstream.headers, githubAuthUrl.toString());
     }
 
     // ---- GET /callback: GitHub redirects back here ----
@@ -552,7 +530,7 @@ function escapeHtml(str) {
   }[c]));
 }
 
-// Final scope set: always mcp:read, mcp:write only if the user chose it.
+// Final scope set: always mcp:read, plus mcp:write when write access is allowed.
 function approvedScopes(requested, write) {
   const scopes = new Set(
     requested.filter((s) => SCOPES_SUPPORTED.includes(s) && s !== 'mcp:write')
@@ -560,6 +538,13 @@ function approvedScopes(requested, write) {
   scopes.add('mcp:read');
   if (write) scopes.add('mcp:write');
   return [...scopes];
+}
+
+// ALLOWED_REDIRECT_URIS: comma-separated; an entry matches exactly or as a prefix.
+// Empty/unset allows any redirect URI.
+function redirectAllowed(redirectUri, list) {
+  const allowed = (list || '').split(',').map((x) => x.trim()).filter(Boolean);
+  return allowed.length === 0 || allowed.some((a) => redirectUri === a || redirectUri.startsWith(a));
 }
 
 function redirectWith(baseHeaders, location) {
@@ -597,34 +582,4 @@ function htmlPage(title, body, status = 200, baseHeaders) {
 
 function errorPage(status, message) {
   return htmlPage('Authorization error', `<h1>Authorization error</h1><p>${escapeHtml(message)}</p>`, status);
-}
-
-function consentPage(desc, consent, clientWantsWrite) {
-  const warnLoopback = desc.redirectIsLoopback
-    ? `<div class="box warn"><strong>Local app.</strong> The tokens go to a program on this device. Any local process could be listening, whatever name it claims.</div>`
-    : '';
-  const verified = desc.clientDomain
-    ? `<p>Verified domain: <code>${escapeHtml(desc.clientDomain)}</code></p>`
-    : `<p><small>The name above is self-reported by the client and not verified.</small></p>`;
-  const body = `<h1>Connect to GitHub</h1>
-<div class="box">
-  <p><strong>${escapeHtml(desc.clientName)}</strong> wants to use your GitHub account through this proxy.</p>
-  ${verified}
-  <p>After you approve, access tokens are sent to:<br><code>${escapeHtml(desc.redirectHost)}</code></p>
-</div>
-${warnLoopback}
-<form method="post" action="/authorize">
-  <input type="hidden" name="handle" value="${escapeHtml(consent.handle)}">
-  <div class="box">
-    <strong>Access level</strong>
-    <label><input type="radio" name="access" value="read"${clientWantsWrite ? '' : ' checked'}> Read-only: browse repos, issues, pull requests</label>
-    <label><input type="radio" name="access" value="write"${clientWantsWrite ? ' checked' : ''}> Read &amp; write: also create, edit and merge</label>
-  </div>
-  <p><small>You will sign in to GitHub next. Only approve clients you set up yourself.</small></p>
-  <div class="row">
-    <button type="submit" name="action" value="deny">Deny</button>
-    <button type="submit" name="action" value="approve" class="primary">Approve</button>
-  </div>
-</form>`;
-  return htmlPage('Connect to GitHub', body, 200, consent.headers);
 }

@@ -11,6 +11,8 @@ id = "1a64a2ae2ec14781bf78f30bed336e07"
 
 # Optional settings (secrets are set with `wrangler secret put`, see README):
 # [vars]
+# ALLOWED_REDIRECT_URIS = "https://claude.ai/api/mcp/auth_callback"   # check `wrangler tail` for the real value
+# READ_ONLY = "true"
 # ALLOWED_GITHUB_USERS = "your-login"     # comma-separated; empty = any GitHub account
 # GITHUB_SCOPES = "repo read:org read:user user:email read:packages write:packages read:project project gist notifications workflow"
 # MCP_LOCKDOWN = "true"                   # ask GitHub to hide public issue content from users without push access

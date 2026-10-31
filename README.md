@@ -12,19 +12,28 @@ MCP client ──/mcp───► this Worker ──Bearer ghp_/gho_…──►
 
 ## Flow
 
-1. The client discovers `/.well-known/oauth-protected-resource/mcp`, registers at `/oauth/register`, and sends the user to `/authorize`.
-2. **Consent page.** The user sees which client is asking and where tokens will be sent, and picks *Read-only* or *Read & write*. The decision is bound to the browser with `__Host-` cookies (CSRF / confused-deputy protection).
-3. The Worker redirects to GitHub (PKCE, bound state), then `/callback` exchanges the code and identifies the GitHub user.
+1. The client discovers `/.well-known/oauth-protected-resource/mcp`, registers at `/oauth/register`, and is sent to `/authorize`.
+2. `/authorize` redirects straight to GitHub (PKCE, server-generated state bound to the browser with a `__Host-` cookie). There is no approve/deny page.
+3. `/callback` exchanges the code, identifies the GitHub user, and issues the client its own tokens.
 4. The GitHub token is encrypted (AES-256-GCM) into the grant props. Each `/mcp` request swaps the proxy token for the GitHub token and streams to `api.githubcopilot.com`.
 
-## Access levels
+## Access level
 
-`mcp:read` is required for every connection. Without `mcp:write` the Worker sends
-`X-MCP-Readonly: true`, so GitHub only exposes read tools. Tokens issued before
-this feature existed carry no write flag and stay read-only until their next refresh.
+Write access (`mcp:write`) is granted by default. Set `READ_ONLY=true` to make every
+connection read-only: the Worker then sends `X-MCP-Readonly: true`, so GitHub only
+exposes read tools. Tokens issued before this logic existed carry no write flag and stay
+read-only until their next refresh.
 
 Clients may still send their own `X-MCP-Toolsets`, `X-MCP-Tools`, `X-MCP-Insiders` headers or use
 `/mcp/x/<toolset>` paths; they pass through. See GitHub's `remote-server.md`.
+
+## Protecting a no-consent setup
+
+Because nothing asks the user to approve, anyone could register a client with their own
+`redirect_uri` and send you a link to `/authorize`; if you are already signed in to GitHub
+they would receive tokens for your account. Set **`ALLOWED_REDIRECT_URIS`** to the callback(s)
+of the clients you actually use. The Worker logs every `redirect_uri` it sees (`wrangler tail`)
+so you can copy the right value.
 
 ## Setup
 
@@ -44,6 +53,8 @@ Clients may still send their own `X-MCP-Toolsets`, `X-MCP-Tools`, `X-MCP-Insider
 
 | Variable | Effect |
 |---|---|
+| `ALLOWED_REDIRECT_URIS` | Comma-separated redirect URIs (exact or prefix match) that clients may use. **Strongly recommended.** Empty = any. |
+| `READ_ONLY` | `true` = no client can get write access. |
 | `ALLOWED_GITHUB_USERS` | Comma-separated GitHub logins allowed to authorize. Empty = anyone. **Recommended for personal deployments.** |
 | `GITHUB_SCOPES` | Space-separated scopes requested from GitHub. Defaults to GitHub's own default set. Add e.g. `workflow` if you see scope challenges in the logs. |
 | `MCP_LOCKDOWN` | `true` sends `X-MCP-Lockdown: true` (hides public issue content from users without push access). |
