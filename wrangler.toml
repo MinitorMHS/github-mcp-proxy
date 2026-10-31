@@ -1,4 +1,4 @@
-name = "copilot-mcp-oauth"
+name = "github-mcp"
 main = "src/index.js"
 compatibility_date = "2026-10-05"
 
