@@ -1,17 +1,27 @@
-name = "github-mcp"
+name = "copilot-mcp-oauth"
 main = "src/index.js"
 compatibility_date = "2026-10-05"
-compatibility_flags = ["global_fetch_strictly_public"]
 
-# KV namespace for OAuth tokens and state
 [[kv_namespaces]]
 binding = "OAUTH_KV"
 id = "1a64a2ae2ec14781bf78f30bed336e07"
 
-# Optional: in-Worker rate limiting backstop
+# Rate limit for MCP API requests
 [[ratelimits]]
 name = "MCP_RL"
 namespace_id = "1001"
 [ratelimits.simple]
 limit = 60
 period = 60
+
+# Strict rate limit for OAuth registration (DCR spam protection)
+[[ratelimits]]
+name = "REG_RL"
+namespace_id = "1002"
+[ratelimits.simple]
+limit = 5
+period = 60
+
+# Daily cleanup cron
+[triggers]
+crons = ["0 3 * * *"]
