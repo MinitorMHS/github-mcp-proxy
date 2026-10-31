@@ -1,0 +1,17 @@
+name = "github-mcp"
+main = "src/index.js"
+compatibility_date = "2026-10-05"
+compatibility_flags = ["global_fetch_strictly_public"]
+
+# KV namespace for OAuth tokens and state
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "YOUR_KV_NAMESPACE_ID"
+
+# Optional: in-Worker rate limiting backstop
+[[ratelimits]]
+name = "MCP_RL"
+namespace_id = "1001"
+[ratelimits.simple]
+limit = 60
+period = 60
