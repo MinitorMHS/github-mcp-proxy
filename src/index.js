@@ -62,7 +62,6 @@ const consentHandler = {
         authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
       } catch (error) {
         if (error instanceof AuthorizationError) {
-          // Safe redirect back to client with error details
           if (error.redirectUri) {
             const redirect = new URL(error.redirectUri);
             redirect.searchParams.set('error', error.code);
@@ -71,13 +70,11 @@ const consentHandler = {
             if (error.issuer) redirect.searchParams.set('iss', error.issuer);
             return Response.redirect(redirect.toString(), 302);
           }
-          // No safe redirect — render error locally
           return new Response(
             `<h1>Authorization Error</h1><p>${escapeHtml(error.description || 'Unknown error')}</p>`,
             { status: 400, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
           );
         }
-        // Unexpected error — re-throw so Cloudflare logs it
         throw error;
       }
 
@@ -94,7 +91,6 @@ const consentHandler = {
         { expirationTtl: 600 }
       );
 
-      // Sanitize user-controlled fields
       const clientName = escapeHtml(authRequest.clientName || 'Unknown Client');
       const stateEscaped = escapeAttr(authRequest.state);
 
@@ -147,26 +143,43 @@ const consentHandler = {
       const csrfFromForm = form.get('csrf');
       const decision = form.get('decision');
 
-      // Validate CSRF token against KV
+      // Read the __Host-csrf cookie
+      const cookieHeader = request.headers.get('Cookie') || '';
+      const cookies = Object.fromEntries(
+        cookieHeader.split(';').map((c) => {
+          const [k, ...v] = c.trim().split('=');
+          return [k, v.join('=')];
+        })
+      );
+      const csrfFromCookie = cookies['__Host-csrf'];
+
       const stateKey = `state:${state}`;
       const stored = await env.OAUTH_KV.get(stateKey, 'json');
-      if (!stored || stored.csrfToken !== csrfFromForm) {
+
+      if (!stored) {
         return new Response('Invalid CSRF token or expired state', { status: 403 });
       }
-      // Single-use: delete state immediately
-      await env.OAUTH_KV.delete(stateKey);
+
+      // Verify CSRF against both form field and HttpOnly cookie
+      if (stored.csrfToken !== csrfFromForm || stored.csrfToken !== csrfFromCookie) {
+        return new Response('Invalid CSRF token or expired state', { status: 403 });
+      }
 
       if (decision !== 'allow') {
+        await env.OAUTH_KV.delete(stateKey);
         return new Response('Access denied', { status: 403 });
       }
 
-      // Redirect user to GitHub for upstream authentication
+      // Build GitHub redirect URL
       const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
       githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
       githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
       githubAuthUrl.searchParams.set('scope', 'repo user:email');
       githubAuthUrl.searchParams.set('state', state);
 
+      // IMPORTANT: do NOT delete state here. Letting it persist makes
+      // double-submit / back-refresh idempotent — repeats return the same 302.
+      // The state expires on its own after the 10-minute TTL.
       return Response.redirect(githubAuthUrl.toString(), 302);
     }
 
@@ -207,6 +220,9 @@ const consentHandler = {
         return new Response('GitHub token exchange failed', { status: 502 });
       }
 
+      // Clean up the state used for this flow
+      await env.OAUTH_KV.delete(`state:${state}`);
+
       // Complete the authorization — store upstream token in props
       return env.OAUTH_PROVIDER.completeAuthorization({
         request,
@@ -239,9 +255,7 @@ export default new OAuthProvider({
   },
   requiredScopes: ['mcp:read'],
 
-  // Disable CIMD — rely on DCR instead.
-  // Claude's CIMD document exceeds the library's 5 KB limit and triggers
-  // a CimdFetchError → 1101. DCR is registered dynamically per client.
+  // Disable CIMD — rely on DCR instead (Claude's CIMD doc exceeds 5 KB).
   clientIdMetadataDocumentEnabled: false,
 
   kv: (env) => env.OAUTH_KV,
