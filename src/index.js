@@ -1,13 +1,60 @@
 import { OAuthProvider, AuthorizationError } from '@cloudflare/workers-oauth-provider';
 
 // ============================================================
-// 1. API handler (resource server): proxies to GitHub MCP
+// 1. Encryption helpers (AES-256-GCM)
+// ============================================================
+async function importKey(keyB64) {
+  const raw = Uint8Array.from(atob(keyB64), (c) => c.charCodeAt(0));
+  return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, [
+    'encrypt',
+    'decrypt',
+  ]);
+}
+
+async function encryptToken(plaintext, keyB64) {
+  const key = await importKey(keyB64);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    new TextEncoder().encode(plaintext)
+  );
+  const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(ciphertext), iv.length);
+  return btoa(String.fromCharCode(...combined));
+}
+
+async function decryptToken(encoded, keyB64) {
+  const key = await importKey(keyB64);
+  const combined = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
+  const iv = combined.slice(0, 12);
+  const ciphertext = combined.slice(12);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    ciphertext
+  );
+  return new TextDecoder().decode(plaintext);
+}
+
+// ============================================================
+// 2. API handler (resource server): proxies to GitHub MCP
 // ============================================================
 const mcpApiHandler = {
   async fetch(request, env, ctx) {
-    const upstreamToken = ctx.props?.githubAccessToken;
-    if (!upstreamToken) {
+    // Decrypt the GitHub token that was stored encrypted in props
+    const encryptedToken = ctx.props?.encryptedGithubToken;
+    if (!encryptedToken) {
       return new Response('Missing upstream token', { status: 401 });
+    }
+
+    let upstreamToken;
+    try {
+      upstreamToken = await decryptToken(encryptedToken, env.ENCRYPTION_KEY);
+    } catch (err) {
+      console.error('Token decryption failed', err.message);
+      return new Response('Token decryption failed', { status: 500 });
     }
 
     if (env.MCP_RL) {
@@ -48,13 +95,21 @@ const mcpApiHandler = {
 };
 
 // ============================================================
-// 2. OAuth handler: redirect to GitHub, then complete authorization
+// 3. OAuth handler
 // ============================================================
 const oauthHandler = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ---- GET /authorize: validate, store authRequest, redirect to GitHub ----
+    // ---- Rate limit /oauth/register to prevent DCR spam ----
+    if (url.pathname === '/oauth/register' && env.REG_RL) {
+      const { success } = await env.REG_RL.limit({
+        key: request.headers.get('CF-Connecting-IP') || 'unknown',
+      });
+      if (!success) return new Response('Rate limited', { status: 429 });
+    }
+
+    // ---- GET /authorize ----
     if (request.method === 'GET' && url.pathname === '/authorize') {
       let authRequest;
       try {
@@ -81,8 +136,6 @@ const oauthHandler = {
         return new Response('GITHUB_CLIENT_ID not configured', { status: 500 });
       }
 
-      // Store the parsed authRequest in KV so the callback can use it.
-      // completeAuthorization() needs the ORIGINAL parsed request, not the callback.
       await env.OAUTH_KV.put(
         `authreq:${authRequest.state}`,
         JSON.stringify(authRequest),
@@ -95,11 +148,10 @@ const oauthHandler = {
       githubAuthUrl.searchParams.set('scope', 'repo user:email');
       githubAuthUrl.searchParams.set('state', authRequest.state);
 
-      console.log('Redirecting to GitHub', { state: authRequest.state });
       return Response.redirect(githubAuthUrl.toString(), 302);
     }
 
-    // ---- GET /callback: GitHub redirects here with code ----
+    // ---- GET /callback ----
     if (request.method === 'GET' && url.pathname === '/callback') {
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
@@ -113,14 +165,12 @@ const oauthHandler = {
         return new Response('Missing code or state', { status: 400 });
       }
 
-      // Retrieve the original parsed authRequest from KV
       const stored = await env.OAUTH_KV.get(`authreq:${state}`);
       if (!stored) {
         return new Response('Authorization request expired or invalid state', { status: 400 });
       }
       const authRequest = JSON.parse(stored);
 
-      // Exchange GitHub code for an access token
       const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -142,25 +192,31 @@ const oauthHandler = {
         return new Response(`GitHub token exchange failed: ${escapeHtml(desc)}`, { status: 502 });
       }
 
-      console.log('GitHub token acquired, completing authorization');
+      // Encrypt the GitHub token before it goes into KV via props
+      let encryptedGithubToken;
+      try {
+        encryptedGithubToken = await encryptToken(
+          tokenData.access_token,
+          env.ENCRYPTION_KEY
+        );
+      } catch (err) {
+        console.error('Token encryption failed', err.message);
+        return new Response('Token encryption failed', { status: 500 });
+      }
 
-      // completeAuthorization expects the ORIGINAL parsed authRequest.
-      // It returns { redirectTo }, which we must redirect to.
       try {
         const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
           request: authRequest,
           userId: 'github-user',
           metadata: {},
-          scope: authRequest.scope, // scopes requested by the client
-          props: { githubAccessToken: tokenData.access_token },
+          scope: authRequest.scope,
+          props: { encryptedGithubToken },  // encrypted, not plaintext
         });
 
-        // Clean up the stored authRequest
         await env.OAUTH_KV.delete(`authreq:${state}`);
-
         return Response.redirect(redirectTo, 302);
       } catch (err) {
-        console.error('completeAuthorization failed', err);
+        console.error('completeAuthorization failed', err.message);
         return new Response(`Authorization completion failed: ${escapeHtml(err.message)}`, {
           status: 500,
         });
@@ -172,9 +228,56 @@ const oauthHandler = {
 };
 
 // ============================================================
-// 3. OAuthProvider configuration
+// 4. Cron cleanup handler (daily 03:00 UTC)
 // ============================================================
-export default new OAuthProvider({
+async function cleanupHandler(env) {
+  let deleted = 0;
+
+  // 1. Orphaned authreq entries (belt-and-suspenders; TTL usually handles these)
+  let cursor;
+  do {
+    const list = await env.OAUTH_KV.list({ prefix: 'authreq:', cursor });
+    for (const key of list.keys) {
+      // If the record is empty/missing it's expired
+      const val = await env.OAUTH_KV.get(key.name);
+      if (!val) {
+        await env.OAUTH_KV.delete(key.name);
+        deleted++;
+      }
+    }
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
+
+  // 2. Orphaned DCR clients (registered but never used for a grant)
+  const clients = await env.OAUTH_KV.list({ prefix: '__client:' });
+  const grants = await env.OAUTH_KV.list({ prefix: '__grant:' });
+
+  const grantedClientIds = new Set();
+  for (const g of grants.keys) {
+    const grant = await env.OAUTH_KV.get(g.name, 'json');
+    if (grant?.clientId) grantedClientIds.add(grant.clientId);
+  }
+
+  for (const c of clients.keys) {
+    const client = await env.OAUTH_KV.get(c.name, 'json');
+    // Only delete clients with no grant AND no timestamp marker we set
+    // (skip if the library has no createdAt — safer to leave them)
+    if (client?.clientId && !grantedClientIds.has(client.clientId)) {
+      // Conservative: only delete if the client object has an expiresAt in the past
+      if (client.expiresAt && client.expiresAt < Date.now()) {
+        await env.OAUTH_KV.delete(c.name);
+        deleted++;
+      }
+    }
+  }
+
+  console.log(`KV cleanup: deleted ${deleted} orphaned keys`);
+}
+
+// ============================================================
+// 5. Exports
+// ============================================================
+const provider = new OAuthProvider({
   apiRoute: '/mcp',
   apiHandler: mcpApiHandler,
   defaultHandler: oauthHandler,
@@ -191,12 +294,20 @@ export default new OAuthProvider({
   requiredScopes: ['mcp:read'],
 
   clientIdMetadataDocumentEnabled: false,
-
   kv: (env) => env.OAUTH_KV,
 });
 
+export default {
+  async fetch(request, env, ctx) {
+    return provider.fetch(request, env, ctx);
+  },
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(cleanupHandler(env));
+  },
+};
+
 // ============================================================
-// 4. Helpers
+// 6. Helpers
 // ============================================================
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({
