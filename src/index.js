@@ -5,6 +5,7 @@ import {
   authorizationErrorRedirect,
   getOAuthApi,
 } from '@cloudflare/workers-oauth-provider';
+import { consentPage, errorPage } from './pages.js';
 
 // ============================================================
 // 0. Configuration
@@ -100,7 +101,20 @@ async function pkcePair() {
   return { verifier, challenge: b64url(new Uint8Array(digest)) };
 }
 
-function githubTokenRequest(env, params) {
+// Optional second GitHub app used for read-only connections (see README). A GitHub App
+// with read-only repository permissions is the only way to get read access to private
+// repos without write access. Both variables must be set for it to be used.
+function hasReadOnlyApp(env) {
+  return Boolean(env.GITHUB_READONLY_CLIENT_ID && env.GITHUB_READONLY_CLIENT_SECRET);
+}
+function githubCredentials(env, readOnlyApp) {
+  return readOnlyApp && hasReadOnlyApp(env)
+    ? { id: env.GITHUB_READONLY_CLIENT_ID, secret: env.GITHUB_READONLY_CLIENT_SECRET }
+    : { id: env.GITHUB_CLIENT_ID, secret: env.GITHUB_CLIENT_SECRET };
+}
+
+function githubTokenRequest(env, params, readOnlyApp = false) {
+  const creds = githubCredentials(env, readOnlyApp);
   return fetch('https://github.com/login/oauth/access_token', {
     method: 'POST',
     headers: {
@@ -109,8 +123,8 @@ function githubTokenRequest(env, params) {
       'User-Agent': GITHUB_UA,
     },
     body: JSON.stringify({
-      client_id: env.GITHUB_CLIENT_ID,
-      client_secret: env.GITHUB_CLIENT_SECRET,
+      client_id: creds.id,
+      client_secret: creds.secret,
       ...params,
     }),
   });
@@ -128,11 +142,12 @@ function githubUserRequest(token) {
 }
 
 // Turns GitHub's token response into the props we persist (tokens encrypted).
-async function buildProps(env, tokenData, login) {
+async function buildProps(env, tokenData, login, readOnlyApp = false) {
   const props = {
     encryptedGithubToken: await encryptToken(tokenData.access_token, env.ENCRYPTION_KEY),
     login,
   };
+  if (readOnlyApp) props.ro = true; // refresh must use the read-only app's credentials
   // Present only for GitHub Apps with expiring user tokens.
   if (tokenData.refresh_token) {
     props.encryptedRefreshToken = await encryptToken(tokenData.refresh_token, env.ENCRYPTION_KEY);
@@ -162,7 +177,7 @@ async function refreshUpstream(env, props, grantId, userId) {
 
   let resp;
   try {
-    resp = await githubTokenRequest(env, { grant_type: 'refresh_token', refresh_token: refreshToken });
+    resp = await githubTokenRequest(env, { grant_type: 'refresh_token', refresh_token: refreshToken }, props.ro === true);
   } catch {
     throw transient('GitHub is unreachable; retry shortly');
   }
@@ -181,7 +196,7 @@ async function refreshUpstream(env, props, grantId, userId) {
     throw new OAuthError('server_error', { description: 'Upstream token refresh failed', statusCode: 502 });
   }
 
-  const fresh = await buildProps(env, data, props.login);
+  const fresh = await buildProps(env, data, props.login, props.ro === true);
   return { ...props, ...fresh };
 }
 
@@ -425,7 +440,7 @@ const oauthHandler = {
           code,
           redirect_uri: `${url.origin}/callback`,
           code_verifier: data?.codeVerifier,
-        });
+        }, data?.readOnlyApp === true);
       } catch {
         return fail('temporarily_unavailable', 'Could not reach GitHub');
       }
@@ -459,7 +474,7 @@ const oauthHandler = {
       }
 
       try {
-        const props = await buildProps(env, tokenData, ghUser.login);
+        const props = await buildProps(env, tokenData, ghUser.login, data?.readOnlyApp === true);
         const { redirectTo } = await helpers.completeAuthorization({
           request: authRequest,
           userId: String(ghUser.id),
@@ -553,13 +568,6 @@ export default {
 // ============================================================
 // 8. Helpers
 // ============================================================
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;',
-    '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
-
 // Final scope set: always mcp:read, plus mcp:write when write access is allowed.
 function approvedScopes(requested, write) {
   const scopes = new Set(
@@ -573,14 +581,15 @@ function approvedScopes(requested, write) {
 // Starts the GitHub leg: PKCE + cookie-bound state, then redirect to GitHub.
 async function beginGithubLogin(helpers, env, url, authRequest, scope, baseHeaders) {
   const pkce = await pkcePair();
+  const canWrite = scope.includes('mcp:write');
+  const readOnlyApp = !canWrite && hasReadOnlyApp(env);
   const upstream = await helpers.beginUpstream(
     { ...authRequest, scope },
-    { data: { codeVerifier: pkce.verifier }, headers: baseHeaders }
+    { data: { codeVerifier: pkce.verifier, readOnlyApp }, headers: baseHeaders }
   );
   const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
-  githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
+  githubAuthUrl.searchParams.set('client_id', githubCredentials(env, readOnlyApp).id);
   githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
-  const canWrite = scope.includes('mcp:write');
   githubAuthUrl.searchParams.set(
     'scope',
     canWrite
@@ -604,70 +613,4 @@ function redirectWith(baseHeaders, location) {
   const headers = new Headers(baseHeaders);
   headers.set('Location', location);
   return new Response(null, { status: 302, headers });
-}
-
-function htmlPage(title, body, status = 200, baseHeaders) {
-  const headers = new Headers(baseHeaders);
-  headers.set('Content-Type', 'text/html; charset=utf-8');
-  headers.set(
-    'Content-Security-Policy',
-    // No form-action directive on purpose: Chromium also applies it to the redirect that
-    // follows a form POST, which blocks the redirect to github.com / the client.
-    "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
-  );
-  headers.set('X-Frame-Options', 'DENY');
-  headers.set('Cache-Control', 'no-store');
-  const doc = `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>${escapeHtml(title)}</title>
-<style>
-  body{font:16px/1.5 system-ui,sans-serif;max-width:30rem;margin:3rem auto;padding:0 1rem}
-  h1{font-size:1.3rem}
-  .box{border:1px solid color-mix(in srgb,currentColor 25%,transparent);border-radius:.6rem;padding:1rem;margin:1rem 0}
-  .warn{border-color:#c0392b;color:#c0392b}
-  label{display:block;margin:.5rem 0;cursor:pointer}
-  code{background:color-mix(in srgb,currentColor 12%,transparent);padding:.1rem .3rem;border-radius:.25rem;word-break:break-all}
-  .row{display:flex;gap:.75rem;margin-top:1.25rem}
-  button{flex:1;font:inherit;padding:.65rem;border-radius:.5rem;border:1px solid currentColor;cursor:pointer;background:transparent;color:inherit}
-  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
-</style></head><body>${body}</body></html>`;
-  return new Response(doc, { status, headers });
-}
-
-function errorPage(status, message) {
-  return htmlPage('Authorization error', `<h1>Authorization error</h1><p>${escapeHtml(message)}</p>`, status);
-}
-
-function consentPage(desc, consent, defaultWrite, readOnly) {
-  const loopback = desc.redirectIsLoopback
-    ? `<div class="box warn"><strong>Local app.</strong> The tokens go to a program on this device. Any local process could be listening, whatever name it claims.</div>`
-    : '';
-  const verified = desc.clientDomain
-    ? `<p>Verified domain: <code>${escapeHtml(desc.clientDomain)}</code></p>`
-    : `<p><small>The name above is self-reported by the client and not verified.</small></p>`;
-  const access = readOnly
-    ? `<div class="box"><strong>Access level:</strong> read-only (this server is set to READ_ONLY)</div>`
-    : `<div class="box">
-    <strong>Access level</strong>
-    <label><input type="radio" name="access" value="read"${defaultWrite ? '' : ' checked'}> Read-only: browse repos, issues, pull requests</label>
-    <label><input type="radio" name="access" value="write"${defaultWrite ? ' checked' : ''}> Read &amp; write: also create, edit and merge</label>
-  </div>`;
-  const body = `<h1>Connect to GitHub</h1>
-<div class="box">
-  <p><strong>${escapeHtml(desc.clientName)}</strong> wants to use your GitHub account through this proxy.</p>
-  ${verified}
-  <p>After you approve, access tokens are sent to:<br><code>${escapeHtml(desc.redirectHost)}</code></p>
-</div>
-${loopback}
-<form method="post" action="/authorize">
-  <input type="hidden" name="handle" value="${escapeHtml(consent.handle)}">
-  ${access}
-  <p><small>You will sign in to GitHub next. Only approve clients you set up yourself.</small></p>
-  <div class="row">
-    <button type="submit" name="action" value="deny">Deny</button>
-    <button type="submit" name="action" value="approve" class="primary">Approve</button>
-  </div>
-</form>`;
-  return htmlPage('Connect to GitHub', body, 200, consent.headers);
 }

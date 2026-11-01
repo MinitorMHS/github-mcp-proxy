@@ -10,6 +10,9 @@ binding = "OAUTH_KV"
 id = "1a64a2ae2ec14781bf78f30bed336e07"
 
 # Optional settings (secrets are set with `wrangler secret put`, see README):
+# Secrets (wrangler secret put): GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, ENCRYPTION_KEY,
+# and optionally GITHUB_READONLY_CLIENT_ID + GITHUB_READONLY_CLIENT_SECRET (read-only GitHub App)
+#
 [vars]
 # ALLOWED_REDIRECT_URIS = "https://claude.ai/api/mcp/auth_callback"   # check `wrangler tail` for the real value
 REQUIRE_CONSENT = "true"               # show an Approve / Deny page (default: no page)

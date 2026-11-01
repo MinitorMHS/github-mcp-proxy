@@ -10,6 +10,11 @@ MCP client ──OAuth──► this Worker ──GitHub OAuth──► github.c
 MCP client ──/mcp───► this Worker ──Bearer ghp_/gho_…──► api.githubcopilot.com/mcp
 ```
 
+## Files
+
+- `src/index.js`: the Worker (OAuth provider, GitHub login, proxy, cleanup).
+- `src/pages.js`: the HTML pages only (consent page and error page). Edit the page markup and styles here.
+
 ## Flow
 
 1. The client discovers `/.well-known/oauth-protected-resource/mcp`, registers at `/oauth/register`, and is sent to `/authorize`.
@@ -38,6 +43,33 @@ read-only until their next refresh.
 
 Clients may still send their own `X-MCP-Toolsets`, `X-MCP-Tools`, `X-MCP-Insiders` headers or use
 `/mcp/x/<toolset>` paths; they pass through. See GitHub's `remote-server.md`.
+
+## Read-only access to private repos (second GitHub App)
+
+Classic OAuth Apps cannot give read-only access to private repositories (`repo` always includes write).
+A **GitHub App** can, because its permissions are set per app. Give read-only connections their own app:
+
+1. GitHub → Settings → Developer settings → GitHub Apps → New GitHub App.
+2. Callback URL: `https://<your-domain>/callback`. Webhook: untick *Active*. Leave *Expire user authorization tokens* on (the Worker refreshes them).
+3. Repository permissions, all **Read-only**: Contents and Metadata at minimum, plus whatever you want the AI to see (Issues, Pull requests, Actions, Discussions, Commit statuses, ...). Leave write permissions off.
+4. Install the app on your account (all repositories, or selected). A GitHub App user token only sees repositories where the app is installed.
+5. Generate a client secret, then:
+   ```bash
+   npx wrangler secret put GITHUB_READONLY_CLIENT_ID
+   npx wrangler secret put GITHUB_READONLY_CLIENT_SECRET
+   ```
+
+When both are set, every read-only connection (READ_ONLY=true, or "Read-only" on the consent page) signs in
+through that app, and the refresh of its expiring token uses the same app. Read & write connections keep using
+`GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`. GitHub Apps ignore the `scope` parameter, so `GITHUB_READONLY_SCOPES`
+does not apply to them. A tool that needs a permission the app lacks will return an error until you add it in the
+app's settings.
+
+## Browser support
+
+The sign-in flow only uses plain redirects, `SameSite=Lax` cookies and a form with no scripts, so it needs no
+browser-specific code. It was tested end to end over HTTPS, including the cross-site round trip back from the
+OAuth server, in Chromium, Firefox 159 and WebKitGTK 2.52 (the WebKit engine; not Safari itself).
 
 ## Optional consent page
 
@@ -76,6 +108,7 @@ so you can copy the right value.
 |---|---|
 | `ALLOWED_REDIRECT_URIS` | Comma-separated redirect URIs (exact or prefix match) that clients may use. **Strongly recommended.** Empty = any. |
 | `REQUIRE_CONSENT` | `true` = show the Approve / Deny page (default: off). |
+| `GITHUB_READONLY_CLIENT_ID` / `GITHUB_READONLY_CLIENT_SECRET` | Secrets for the optional read-only GitHub App (see above). |
 | `READ_ONLY` | `true` = no client can get write access. |
 | `ALLOWED_GITHUB_USERS` | Comma-separated GitHub logins allowed to authorize. Empty = anyone. **Recommended for personal deployments.** |
 | `GITHUB_READONLY_SCOPES` | Scopes requested in read-only mode. Default: `read:org read:user user:email read:packages read:project` (no `repo`). |
