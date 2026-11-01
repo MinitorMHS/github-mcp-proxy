@@ -19,6 +19,18 @@ MCP client ──/mcp───► this Worker ──Bearer ghp_/gho_…──►
 
 ## Access level
 
+Read-only mode is enforced twice: the proxy forces `X-MCP-Readonly: true`, **and** GitHub is asked
+for read-only scopes (`GITHUB_READONLY_SCOPES`, default `read:org read:user user:email read:packages read:project`),
+so GitHub's own approval page and the resulting token match. Classic OAuth has no read-only form of `repo`,
+so read-only connections cannot see **private** repositories (public ones work without any scope). For
+read-only access to private repos, use a GitHub App with read-only repository permissions, or add `repo`
+to `GITHUB_READONLY_SCOPES` and accept that GitHub's page will then ask for write access and the limit is
+enforced by this proxy only.
+
+If you authorized the OAuth App before, GitHub may reuse the earlier grant. After switching modes, check
+`wrangler tail` for `GitHub granted scopes:`, and if it is broader than expected revoke the app at
+github.com/settings/applications and connect again.
+
 Write access (`mcp:write`) is granted by default. Set `READ_ONLY=true` to make every
 connection read-only: the Worker then sends `X-MCP-Readonly: true`, so GitHub only
 exposes read tools. Tokens issued before this logic existed carry no write flag and stay
@@ -66,6 +78,7 @@ so you can copy the right value.
 | `REQUIRE_CONSENT` | `true` = show the Approve / Deny page (default: off). |
 | `READ_ONLY` | `true` = no client can get write access. |
 | `ALLOWED_GITHUB_USERS` | Comma-separated GitHub logins allowed to authorize. Empty = anyone. **Recommended for personal deployments.** |
+| `GITHUB_READONLY_SCOPES` | Scopes requested in read-only mode. Default: `read:org read:user user:email read:packages read:project` (no `repo`). |
 | `GITHUB_SCOPES` | Space-separated scopes requested from GitHub. Defaults to GitHub's own default set. Add e.g. `workflow` if you see scope challenges in the logs. |
 | `MCP_LOCKDOWN` | `true` sends `X-MCP-Lockdown: true` (hides public issue content from users without push access). |
 

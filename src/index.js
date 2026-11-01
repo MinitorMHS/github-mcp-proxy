@@ -29,6 +29,15 @@ const SCOPES_SUPPORTED = ['mcp:read', 'mcp:write', 'offline_access'];
 const DEFAULT_GITHUB_SCOPES =
   'repo read:org read:user user:email read:packages write:packages read:project project gist notifications';
 
+// Scopes requested from GitHub when the connection is read-only (READ_ONLY=true, or
+// "Read-only" chosen on the consent page). GitHub's `repo` scope always includes write
+// access and classic OAuth has no read-only variant of it, so it is left out: private
+// repositories are not reachable in this mode, public ones still are. Override with
+// GITHUB_READONLY_SCOPES (adding `repo` brings private repos back, but then GitHub's own
+// page asks for write access and the read-only limit is enforced by this proxy only).
+const DEFAULT_READONLY_GITHUB_SCOPES =
+  'read:org read:user user:email read:packages read:project';
+
 const ACCESS_TOKEN_TTL = 3600; // seconds, proxy-issued access tokens
 const DCR_CLIENT_TTL = 60 * 60 * 24 * 90; // seconds, dynamically registered clients
 // Refresh the upstream GitHub token when less than this remains (GitHub App
@@ -571,7 +580,13 @@ async function beginGithubLogin(helpers, env, url, authRequest, scope, baseHeade
   const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
   githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
   githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
-  githubAuthUrl.searchParams.set('scope', env.GITHUB_SCOPES || DEFAULT_GITHUB_SCOPES);
+  const canWrite = scope.includes('mcp:write');
+  githubAuthUrl.searchParams.set(
+    'scope',
+    canWrite
+      ? env.GITHUB_SCOPES || DEFAULT_GITHUB_SCOPES
+      : env.GITHUB_READONLY_SCOPES ?? DEFAULT_READONLY_GITHUB_SCOPES
+  );
   githubAuthUrl.searchParams.set('state', upstream.state);
   githubAuthUrl.searchParams.set('code_challenge', pkce.challenge);
   githubAuthUrl.searchParams.set('code_challenge_method', 'S256');

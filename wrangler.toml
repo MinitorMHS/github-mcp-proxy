@@ -16,6 +16,7 @@ REQUIRE_CONSENT = "true"               # show an Approve / Deny page (default: n
 # READ_ONLY = "true"
 # ALLOWED_GITHUB_USERS = "your-login"     # comma-separated; empty = any GitHub account
 GITHUB_SCOPES = "repo read:org read:user user:email read:packages write:packages read:project project gist notifications workflow"
+GITHUB_READONLY_SCOPES = "read:org read:user user:email read:packages read:project"   # used in read-only mode
 # MCP_LOCKDOWN = "true"                   # ask GitHub to hide public issue content from users without push access
 
 # Rate limit for MCP API requests (keyed per GitHub user)
