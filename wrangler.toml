@@ -10,7 +10,7 @@ binding = "OAUTH_KV"
 id = "1a64a2ae2ec14781bf78f30bed336e07"
 
 # Optional settings (secrets are set with `wrangler secret put`, see README):
-# [vars]
+[vars]
 # ALLOWED_REDIRECT_URIS = "https://claude.ai/api/mcp/auth_callback"   # check `wrangler tail` for the real value
 REQUIRE_CONSENT = "true"               # show an Approve / Deny page (default: no page)
 # READ_ONLY = "true"
