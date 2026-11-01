@@ -348,22 +348,43 @@ const oauthHandler = {
         return errorPage(400, 'This client\'s redirect address is not allowed on this server.');
       }
 
-      // mcp:write is granted unless READ_ONLY=true.
-      const scope = approvedScopes(authRequest.scope, env.READ_ONLY !== 'true');
-      const pkce = await pkcePair();
-      const upstream = await helpers.beginUpstream(
-        { ...authRequest, scope },
-        { data: { codeVerifier: pkce.verifier } }
-      );
+      if (env.REQUIRE_CONSENT === 'true') {
+        const description = await helpers.describeConsent(authRequest);
+        const consent = await helpers.beginConsent(authRequest);
+        return consentPage(description, consent, env.READ_ONLY !== 'true', env.READ_ONLY === 'true');
+      }
 
-      const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
-      githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
-      githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
-      githubAuthUrl.searchParams.set('scope', env.GITHUB_SCOPES || DEFAULT_GITHUB_SCOPES);
-      githubAuthUrl.searchParams.set('state', upstream.state);
-      githubAuthUrl.searchParams.set('code_challenge', pkce.challenge);
-      githubAuthUrl.searchParams.set('code_challenge_method', 'S256');
-      return redirectWith(upstream.headers, githubAuthUrl.toString());
+      // No consent page: write access unless READ_ONLY=true.
+      const scope = approvedScopes(authRequest.scope, env.READ_ONLY !== 'true');
+      return beginGithubLogin(helpers, env, url, authRequest, scope);
+    }
+
+    // ---- POST /authorize: consent decision (only when REQUIRE_CONSENT=true) ----
+    if (request.method === 'POST' && url.pathname === '/authorize' && env.REQUIRE_CONSENT === 'true') {
+      let form;
+      try {
+        form = await request.formData();
+      } catch {
+        return errorPage(400, 'Invalid form submission.');
+      }
+      const handle = form.get('handle');
+      if (typeof handle !== 'string' || !handle) return errorPage(400, 'Missing consent handle.');
+
+      try {
+        if (form.get('action') !== 'approve') {
+          const denied = await helpers.denyConsent(request, handle);
+          return new Response(null, { status: 302, headers: denied.headers });
+        }
+        const approved = await helpers.approveConsent(request, handle);
+        const write = env.READ_ONLY !== 'true' && form.get('access') === 'write';
+        const scope = approvedScopes(approved.request.scope, write);
+        return beginGithubLogin(helpers, env, url, approved.request, scope, approved.headers);
+      } catch (error) {
+        if (error instanceof AuthorizationError) {
+          return errorPage(400, 'This authorization request expired or was already used. Start again from your MCP client.');
+        }
+        throw error;
+      }
     }
 
     // ---- GET /callback: GitHub redirects back here ----
@@ -540,6 +561,23 @@ function approvedScopes(requested, write) {
   return [...scopes];
 }
 
+// Starts the GitHub leg: PKCE + cookie-bound state, then redirect to GitHub.
+async function beginGithubLogin(helpers, env, url, authRequest, scope, baseHeaders) {
+  const pkce = await pkcePair();
+  const upstream = await helpers.beginUpstream(
+    { ...authRequest, scope },
+    { data: { codeVerifier: pkce.verifier }, headers: baseHeaders }
+  );
+  const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
+  githubAuthUrl.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
+  githubAuthUrl.searchParams.set('redirect_uri', `${url.origin}/callback`);
+  githubAuthUrl.searchParams.set('scope', env.GITHUB_SCOPES || DEFAULT_GITHUB_SCOPES);
+  githubAuthUrl.searchParams.set('state', upstream.state);
+  githubAuthUrl.searchParams.set('code_challenge', pkce.challenge);
+  githubAuthUrl.searchParams.set('code_challenge_method', 'S256');
+  return redirectWith(upstream.headers, githubAuthUrl.toString());
+}
+
 // ALLOWED_REDIRECT_URIS: comma-separated; an entry matches exactly or as a prefix.
 // Empty/unset allows any redirect URI.
 function redirectAllowed(redirectUri, list) {
@@ -558,7 +596,9 @@ function htmlPage(title, body, status = 200, baseHeaders) {
   headers.set('Content-Type', 'text/html; charset=utf-8');
   headers.set(
     'Content-Security-Policy',
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    // No form-action directive on purpose: Chromium also applies it to the redirect that
+    // follows a form POST, which blocks the redirect to github.com / the client.
+    "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
   );
   headers.set('X-Frame-Options', 'DENY');
   headers.set('Cache-Control', 'no-store');
@@ -582,4 +622,37 @@ function htmlPage(title, body, status = 200, baseHeaders) {
 
 function errorPage(status, message) {
   return htmlPage('Authorization error', `<h1>Authorization error</h1><p>${escapeHtml(message)}</p>`, status);
+}
+
+function consentPage(desc, consent, defaultWrite, readOnly) {
+  const loopback = desc.redirectIsLoopback
+    ? `<div class="box warn"><strong>Local app.</strong> The tokens go to a program on this device. Any local process could be listening, whatever name it claims.</div>`
+    : '';
+  const verified = desc.clientDomain
+    ? `<p>Verified domain: <code>${escapeHtml(desc.clientDomain)}</code></p>`
+    : `<p><small>The name above is self-reported by the client and not verified.</small></p>`;
+  const access = readOnly
+    ? `<div class="box"><strong>Access level:</strong> read-only (this server is set to READ_ONLY)</div>`
+    : `<div class="box">
+    <strong>Access level</strong>
+    <label><input type="radio" name="access" value="read"${defaultWrite ? '' : ' checked'}> Read-only: browse repos, issues, pull requests</label>
+    <label><input type="radio" name="access" value="write"${defaultWrite ? ' checked' : ''}> Read &amp; write: also create, edit and merge</label>
+  </div>`;
+  const body = `<h1>Connect to GitHub</h1>
+<div class="box">
+  <p><strong>${escapeHtml(desc.clientName)}</strong> wants to use your GitHub account through this proxy.</p>
+  ${verified}
+  <p>After you approve, access tokens are sent to:<br><code>${escapeHtml(desc.redirectHost)}</code></p>
+</div>
+${loopback}
+<form method="post" action="/authorize">
+  <input type="hidden" name="handle" value="${escapeHtml(consent.handle)}">
+  ${access}
+  <p><small>You will sign in to GitHub next. Only approve clients you set up yourself.</small></p>
+  <div class="row">
+    <button type="submit" name="action" value="deny">Deny</button>
+    <button type="submit" name="action" value="approve" class="primary">Approve</button>
+  </div>
+</form>`;
+  return htmlPage('Connect to GitHub', body, 200, consent.headers);
 }

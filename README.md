@@ -13,7 +13,7 @@ MCP client ──/mcp───► this Worker ──Bearer ghp_/gho_…──►
 ## Flow
 
 1. The client discovers `/.well-known/oauth-protected-resource/mcp`, registers at `/oauth/register`, and is sent to `/authorize`.
-2. `/authorize` redirects straight to GitHub (PKCE, server-generated state bound to the browser with a `__Host-` cookie). There is no approve/deny page.
+2. `/authorize` redirects straight to GitHub (PKCE, server-generated state bound to the browser with a `__Host-` cookie). By default there is no approve/deny page; set `REQUIRE_CONSENT=true` to add one (see below).
 3. `/callback` exchanges the code, identifies the GitHub user, and issues the client its own tokens.
 4. The GitHub token is encrypted (AES-256-GCM) into the grant props. Each `/mcp` request swaps the proxy token for the GitHub token and streams to `api.githubcopilot.com`.
 
@@ -26,6 +26,15 @@ read-only until their next refresh.
 
 Clients may still send their own `X-MCP-Toolsets`, `X-MCP-Tools`, `X-MCP-Insiders` headers or use
 `/mcp/x/<toolset>` paths; they pass through. See GitHub's `remote-server.md`.
+
+## Optional consent page
+
+`REQUIRE_CONSENT=true` shows an Approve / Deny page before the GitHub redirect. It names the client,
+shows where tokens will be sent, and lets you choose Read-only or Read & write (hidden when
+`READ_ONLY=true`). It is the only protection against the attack below if you do not set
+`ALLOWED_REDIRECT_URIS`; with the allowlist set it adds no extra security, only a click.
+The page deliberately sends no `form-action` CSP directive: Chromium applies that directive to the
+redirect after the form POST and would block the jump to GitHub (tested in Chromium).
 
 ## Protecting a no-consent setup
 
@@ -54,6 +63,7 @@ so you can copy the right value.
 | Variable | Effect |
 |---|---|
 | `ALLOWED_REDIRECT_URIS` | Comma-separated redirect URIs (exact or prefix match) that clients may use. **Strongly recommended.** Empty = any. |
+| `REQUIRE_CONSENT` | `true` = show the Approve / Deny page (default: off). |
 | `READ_ONLY` | `true` = no client can get write access. |
 | `ALLOWED_GITHUB_USERS` | Comma-separated GitHub logins allowed to authorize. Empty = anyone. **Recommended for personal deployments.** |
 | `GITHUB_SCOPES` | Space-separated scopes requested from GitHub. Defaults to GitHub's own default set. Add e.g. `workflow` if you see scope challenges in the logs. |
