@@ -7,12 +7,14 @@
   "license": "MIT",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "probe": "node test/probe.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^1.2.4"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.0.0",
+    "@modelcontextprotocol/sdk": "^1.32.2"
   }
 }

@@ -17,6 +17,9 @@ const PUBLIC_ORIGIN = 'https://github.miix.ir';
 const MCP_PATH = '/mcp';
 
 const TARGET_HOST = 'api.githubcopilot.com';
+const UPSTREAM_PUBLIC = `https://${TARGET_HOST}`; // how GitHub writes its own URLs
+const UPSTREAM_ORIGIN = UPSTREAM_PUBLIC; // where requests are sent
+const MAX_UPSTREAM_REDIRECTS = 5;
 const GITHUB_UA = 'github-mcp-proxy';
 
 // Scopes this proxy hands to MCP clients.
@@ -234,6 +237,71 @@ async function tokenExchangeCallback(opts) {
 // ============================================================
 // 4. API handler (resource server): proxies to GitHub MCP
 // ============================================================
+// Same host as the upstream (also matches the overridden origin used in tests).
+function isUpstreamUrl(u) {
+  return u.hostname === TARGET_HOST || u.origin === UPSTREAM_ORIGIN;
+}
+
+// Sends the request upstream. Redirects that stay on the upstream host are followed
+// here, so the client never receives a Location pointing at a host it may not reach.
+async function fetchUpstream(method, pathAndQuery, headers, body) {
+  let m = method;
+  let b = body;
+  let h = headers;
+  let target = UPSTREAM_ORIGIN + pathAndQuery;
+  for (let hop = 0; ; hop++) {
+    const resp = await fetch(target, { method: m, headers: h, body: b, redirect: 'manual' });
+    if (![301, 302, 303, 307, 308].includes(resp.status) || hop >= MAX_UPSTREAM_REDIRECTS) return resp;
+    const location = resp.headers.get('Location');
+    if (!location) return resp;
+    let next;
+    try {
+      next = new URL(location, target);
+    } catch {
+      return resp;
+    }
+    if (!isUpstreamUrl(next)) return resp; // some other host: not ours to follow
+    if (resp.status === 303 || ((resp.status === 301 || resp.status === 302) && m === 'POST')) {
+      m = 'GET'; // standard redirect semantics: method becomes GET, body is dropped
+      b = undefined;
+      h = new Headers(h);
+      h.delete('Content-Length');
+      h.delete('Content-Type');
+    }
+    console.log(`mcp upstream redirect ${resp.status} -> ${next.pathname}`);
+    resp.body?.cancel();
+    target = UPSTREAM_ORIGIN + next.pathname + next.search;
+  }
+}
+
+// Copy of the upstream response headers that is safe to hand to the client.
+function proxyResponseHeaders(upstreamHeaders) {
+  const h = new Headers(upstreamHeaders);
+  for (const name of [
+    'Set-Cookie', 'Connection', 'Keep-Alive', 'Transfer-Encoding', 'TE', 'Trailer',
+    'Upgrade', 'Proxy-Authenticate', 'Proxy-Authorization',
+  ]) {
+    h.delete(name);
+  }
+  // Any absolute link to the upstream host would send the client straight to it.
+  for (const name of ['Location', 'Content-Location', 'Link', 'WWW-Authenticate']) {
+    const v = h.get(name);
+    if (v && v.includes(UPSTREAM_PUBLIC)) h.set(name, v.split(UPSTREAM_PUBLIC).join(PUBLIC_ORIGIN));
+  }
+  return h;
+}
+
+// JSON-RPC method name(s) of a request body, for logging only (params are never read).
+function rpcMethod(buf) {
+  if (!buf || buf.byteLength === 0 || buf.byteLength > 1_000_000) return '-';
+  try {
+    const j = JSON.parse(new TextDecoder().decode(buf));
+    return Array.isArray(j) ? j.map((x) => x.method).join(',') : j.method ?? '-';
+  } catch {
+    return '-';
+  }
+}
+
 const RESOURCE_METADATA_URL = `${PUBLIC_ORIGIN}/.well-known/oauth-protected-resource${MCP_PATH}`;
 
 const mcpApiHandler = {
@@ -260,7 +328,7 @@ const mcpApiHandler = {
     }
 
     const url = new URL(request.url);
-    const targetUrl = new URL(`https://${TARGET_HOST}${url.pathname}${url.search}`);
+    const started = Date.now();
 
     const headers = new Headers(request.headers);
     headers.set('Authorization', `Bearer ${upstreamToken}`);
@@ -277,14 +345,30 @@ const mcpApiHandler = {
     if (props.canWrite !== true) headers.set('X-MCP-Readonly', 'true');
     if (env.MCP_LOCKDOWN === 'true') headers.set('X-MCP-Lockdown', 'true');
 
-    const upstream = await fetch(
-      new Request(targetUrl, {
-        method: request.method,
-        headers,
-        body: request.body,
-        redirect: 'manual',
-      })
-    );
+    // MCP request bodies are small JSON; buffering lets a redirect be replayed.
+    const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
+    const bodyBuf = hasBody ? await request.arrayBuffer() : undefined;
+    const rpc = rpcMethod(bodyBuf);
+
+    let upstream;
+    try {
+      upstream = await fetchUpstream(request.method, url.pathname + url.search, headers, bodyBuf);
+    } catch (err) {
+      console.error(`mcp ${request.method} ${url.pathname} rpc=${rpc} -> upstream unreachable: ${err.message}`);
+      return new Response(
+        JSON.stringify({ error: 'upstream_unreachable', message: 'The proxy could not reach GitHub.' }),
+        { status: 502, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const contentType = upstream.headers.get('Content-Type') || '-';
+    console.log(`mcp ${request.method} ${url.pathname} rpc=${rpc} -> ${upstream.status} ${contentType} ${Date.now() - started}ms`);
+    // (405 on the GET stream is normal for stateless MCP servers, not worth a warning.)
+    if (upstream.status >= 400 && upstream.status !== 405 && !contentType.includes('event-stream')) {
+      // The reason for a failure is usually in GitHub's error body.
+      const snippet = await upstream.clone().text().then((t) => t.slice(0, 300), () => '');
+      console.warn(`mcp upstream ${upstream.status} body: ${snippet}`);
+    }
 
     // GitHub rejected the stored token. Only treat it as dead if the REST API agrees,
     // then revoke the grant so the client is forced through a fresh authorization
@@ -296,22 +380,30 @@ const mcpApiHandler = {
       } catch {
         // network error: leave the grant alone
       }
-      if (dead && props.grantId && props.userId) {
-        try {
-          await env.OAUTH_PROVIDER.revokeGrant(props.grantId, props.userId);
-        } catch (err) {
-          console.error('revokeGrant failed', err.message);
+      if (dead) {
+        if (props.grantId && props.userId) {
+          try {
+            await env.OAUTH_PROVIDER.revokeGrant(props.grantId, props.userId);
+          } catch (err) {
+            console.error('revokeGrant failed', err.message);
+          }
         }
+        return new Response('GitHub rejected the stored token. Reconnect to authorize again.', {
+          status: 401,
+          headers: {
+            'WWW-Authenticate': `Bearer error="invalid_token", error_description="GitHub token rejected", resource_metadata="${RESOURCE_METADATA_URL}"`,
+          },
+        });
       }
-      return new Response('GitHub rejected the stored token. Reconnect to authorize again.', {
-        status: 401,
-        headers: {
-          'WWW-Authenticate': `Bearer error="invalid_token", error_description="GitHub token rejected", resource_metadata="${RESOURCE_METADATA_URL}"`,
-        },
-      });
+      // The token is fine, so re-authorizing would not help: pass GitHub's answer on
+      // as it is (without a challenge that would send the client around in circles).
+      console.warn('GitHub returned 401 although the token is still valid');
+      const h = proxyResponseHeaders(upstream.headers);
+      h.delete('WWW-Authenticate');
+      return new Response(upstream.body, { status: 401, statusText: upstream.statusText, headers: h });
     }
 
-    const responseHeaders = new Headers(upstream.headers);
+    const responseHeaders = proxyResponseHeaders(upstream.headers);
     if (upstream.status === 403) {
       // GitHub's remote server answers missing OAuth scopes with a challenge that
       // points the client at GitHub. Clients can't step up through this proxy, so

@@ -121,9 +121,38 @@ If you use a GitHub App with expiring user tokens, the Worker stores the refresh
 token and renews the GitHub token when the client refreshes its proxy token. OAuth
 App tokens do not expire and need no refresh.
 
+## Troubleshooting ("connected, tools fetch failed")
+
+"Connected" only proves the sign-in worked; the tool list is a separate request. To see which step fails,
+run the probe **from the machine and network your MCP client uses**:
+
+```bash
+npm install
+npm run probe -- https://<your-domain>/mcp
+```
+
+It signs in through the proxy with the official MCP client (it prints an address to open in a browser), lists
+the tools, and reports the failing step. Then check the Worker side with `npx wrangler tail`: every proxied
+request logs one line, for example
+
+```
+mcp POST /mcp rpc=tools/list -> 200 text/event-stream 48ms
+mcp POST /mcp rpc=tools/list -> 403 application/json 120ms
+mcp upstream 403 body: {"message": ...}
+```
+
+- **No HTTP answer in the probe** (`fetch failed`, `ENOTFOUND`, timeouts): that machine cannot reach the proxy address.
+- **A 4xx/5xx line with GitHub's message in `wrangler tail`**: GitHub refused the call (permissions, Copilot access, token type). The message says why.
+- **`upstream unreachable`**: the Worker could not reach GitHub.
+
+The proxy never hands the client a link to GitHub's API host: redirects are followed inside the Worker, and URLs in
+`Location`, `Link` and `WWW-Authenticate` headers are rewritten to the proxy's own address, so a client that can only
+reach the proxy never needs to reach anything else. Upstream cookies are dropped.
+
 ## Operations
 
 - A daily cron runs the library's `purgeExpiredData()` sweep. DCR clients expire after 90 days on their own.
 - If GitHub rejects the stored token (revoked), the grant is revoked and the client is sent back through authorization.
+- Every proxied request is logged (method, path, JSON-RPC method, status, time); error bodies are logged truncated.
 - GitHub scope challenges (HTTP 403) are logged with the missing scope and returned without the upstream `WWW-Authenticate` header.
 - Orgs with OAuth App access restrictions must approve the app: `https://github.com/organizations/<ORG>/settings/oauth_application_policy`.
