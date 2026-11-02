@@ -20,6 +20,8 @@ const TARGET_HOST = 'api.githubcopilot.com';
 const UPSTREAM_PUBLIC = `https://${TARGET_HOST}`; // how GitHub writes its own URLs
 const UPSTREAM_ORIGIN = UPSTREAM_PUBLIC; // where requests are sent
 const MAX_UPSTREAM_REDIRECTS = 5;
+// How long to wait for GitHub to START answering (headers). Streaming bodies are not cut off.
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 40000;
 const GITHUB_UA = 'github-mcp-proxy';
 
 // Scopes this proxy hands to MCP clients.
@@ -237,6 +239,65 @@ async function tokenExchangeCallback(opts) {
 // ============================================================
 // 4. API handler (resource server): proxies to GitHub MCP
 // ============================================================
+// Passes a response body through unchanged while logging how much was delivered and when,
+// so a stalled download can be told apart from a slow or silent upstream.
+function countedBody(body, label, started) {
+  if (!body) return body;
+  const reader = body.getReader();
+  let bytes = 0;
+  let firstByteAt = null;
+  let lastChunkAt = Date.now();
+  let waitingSince = null; // set while we are waiting on GitHub for the next chunk
+  let finished = false;
+  let ticks = 0;
+  const stop = () => {
+    finished = true;
+    clearInterval(progress);
+  };
+  // Only logs when a body is slow (every 5s) and says which side is holding things up.
+  // The stream is read on demand: if no read is pending, nobody is asking for more data,
+  // so the connection back to the client is the bottleneck; if a read is pending, GitHub is.
+  const progress = setInterval(() => {
+    if (finished || ++ticks > 12) return clearInterval(progress);
+    const who = waitingSince !== null
+      ? `waiting for more data from GitHub (${Date.now() - waitingSince}ms so far)`
+      : 'GitHub data is ready but the connection back to the client is not taking it';
+    console.warn(`${label} still streaming after ${Date.now() - started}ms: ${bytes} bytes sent, last data ${Date.now() - lastChunkAt}ms ago; ${who}`);
+  }, 5000);
+
+  return new ReadableStream(
+    {
+      async pull(controller) {
+        waitingSince = Date.now();
+        try {
+          const { done, value } = await reader.read();
+          waitingSince = null;
+          if (done) {
+            stop();
+            console.log(`${label} body complete: ${bytes} bytes in ${Date.now() - started}ms (first byte at ${firstByteAt}ms)`);
+            controller.close();
+            return;
+          }
+          lastChunkAt = Date.now();
+          if (firstByteAt === null) firstByteAt = lastChunkAt - started;
+          bytes += value.byteLength;
+          controller.enqueue(value);
+        } catch (err) {
+          stop();
+          console.warn(`${label} body cut off after ${bytes} bytes at ${Date.now() - started}ms: ${err?.message ?? err}`);
+          controller.error(err);
+        }
+      },
+      cancel(reason) {
+        stop();
+        console.warn(`${label} client went away after ${bytes} bytes at ${Date.now() - started}ms`);
+        return reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 }
+  );
+}
+
 // Same host as the upstream (also matches the overridden origin used in tests).
 function isUpstreamUrl(u) {
   return u.hostname === TARGET_HOST || u.origin === UPSTREAM_ORIGIN;
@@ -244,13 +305,13 @@ function isUpstreamUrl(u) {
 
 // Sends the request upstream. Redirects that stay on the upstream host are followed
 // here, so the client never receives a Location pointing at a host it may not reach.
-async function fetchUpstream(method, pathAndQuery, headers, body) {
+async function fetchUpstream(method, pathAndQuery, headers, body, signal) {
   let m = method;
   let b = body;
   let h = headers;
   let target = UPSTREAM_ORIGIN + pathAndQuery;
   for (let hop = 0; ; hop++) {
-    const resp = await fetch(target, { method: m, headers: h, body: b, redirect: 'manual' });
+    const resp = await fetch(target, { method: m, headers: h, body: b, redirect: 'manual', signal });
     if (![301, 302, 303, 307, 308].includes(resp.status) || hop >= MAX_UPSTREAM_REDIRECTS) return resp;
     const location = resp.headers.get('Location');
     if (!location) return resp;
@@ -350,19 +411,35 @@ const mcpApiHandler = {
     const bodyBuf = hasBody ? await request.arrayBuffer() : undefined;
     const rpc = rpcMethod(bodyBuf);
 
+    const label = `mcp ${request.method} ${url.pathname} rpc=${rpc}`;
+    console.log(`${label} -> sent to GitHub`);
+
+    // Give GitHub a bounded time to start answering; once headers arrive the body streams freely.
+    const timeoutMs = Number(env.UPSTREAM_TIMEOUT_MS) || DEFAULT_UPSTREAM_TIMEOUT_MS;
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), timeoutMs);
     let upstream;
     try {
-      upstream = await fetchUpstream(request.method, url.pathname + url.search, headers, bodyBuf);
+      upstream = await fetchUpstream(request.method, url.pathname + url.search, headers, bodyBuf, abort.signal);
     } catch (err) {
-      console.error(`mcp ${request.method} ${url.pathname} rpc=${rpc} -> upstream unreachable: ${err.message}`);
+      if (abort.signal.aborted) {
+        console.error(`${label} -> GitHub sent no answer within ${timeoutMs}ms`);
+        return new Response(
+          JSON.stringify({ error: 'upstream_timeout', message: `GitHub did not answer within ${Math.round(timeoutMs / 1000)} seconds.` }),
+          { status: 504, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      console.error(`${label} -> upstream unreachable: ${err.message}`);
       return new Response(
         JSON.stringify({ error: 'upstream_unreachable', message: 'The proxy could not reach GitHub.' }),
         { status: 502, headers: { 'Content-Type': 'application/json' } }
       );
+    } finally {
+      clearTimeout(timer);
     }
 
     const contentType = upstream.headers.get('Content-Type') || '-';
-    console.log(`mcp ${request.method} ${url.pathname} rpc=${rpc} -> ${upstream.status} ${contentType} ${Date.now() - started}ms`);
+    console.log(`${label} -> ${upstream.status} ${contentType} headers after ${Date.now() - started}ms`);
     // (405 on the GET stream is normal for stateless MCP servers, not worth a warning.)
     if (upstream.status >= 400 && upstream.status !== 405 && !contentType.includes('event-stream')) {
       // The reason for a failure is usually in GitHub's error body.
@@ -415,7 +492,7 @@ const mcpApiHandler = {
       }
     }
 
-    return new Response(upstream.body, {
+    return new Response(countedBody(upstream.body, label, started), {
       status: upstream.status,
       statusText: upstream.statusText,
       headers: responseHeaders,

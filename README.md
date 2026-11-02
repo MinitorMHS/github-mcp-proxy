@@ -112,6 +112,7 @@ so you can copy the right value.
 | `READ_ONLY` | `true` = no client can get write access. |
 | `ALLOWED_GITHUB_USERS` | Comma-separated GitHub logins allowed to authorize. Empty = anyone. **Recommended for personal deployments.** |
 | `GITHUB_READONLY_SCOPES` | Scopes requested in read-only mode. Default: `read:org read:user user:email read:packages read:project` (no `repo`). |
+| `UPSTREAM_TIMEOUT_MS` | How long to wait for GitHub to start answering before returning 504 (default 40000). |
 | `GITHUB_SCOPES` | Space-separated scopes requested from GitHub. Defaults to GitHub's own default set. Add e.g. `workflow` if you see scope challenges in the logs. |
 | `MCP_LOCKDOWN` | `true` sends `X-MCP-Lockdown: true` (hides public issue content from users without push access). |
 
@@ -141,9 +142,20 @@ mcp POST /mcp rpc=tools/list -> 403 application/json 120ms
 mcp upstream 403 body: {"message": ...}
 ```
 
-- **No HTTP answer in the probe** (`fetch failed`, `ENOTFOUND`, timeouts): that machine cannot reach the proxy address.
-- **A 4xx/5xx line with GitHub's message in `wrangler tail`**: GitHub refused the call (permissions, Copilot access, token type). The message says why.
-- **`upstream unreachable`**: the Worker could not reach GitHub.
+- **No HTTP answer in the probe** (`fetch failed`, `ENOTFOUND`, timeouts to connect): that machine cannot reach the proxy address.
+- **`MCP error -32001: Request timed out`** is the *client's* own timeout: no complete answer arrived in time. The `wrangler tail` lines for `rpc=tools/list` say why:
+
+| What the log shows | Meaning |
+|---|---|
+| `-> sent to GitHub` and nothing else, then `GitHub sent no answer within 40000ms` (client gets a 504) | GitHub never answered. Wait/retry, or check the token and Copilot access. |
+| `-> 200 ...` then `still streaming ...; waiting for more data from GitHub` | GitHub started answering and stopped sending. |
+| `-> 200 ...` then `still streaming ...; GitHub data is ready but the connection back to the client is not taking it` | GitHub is fine; the path between Cloudflare and the client is too slow or stuck for a response this size. |
+| `body complete: N bytes in Xms` | The whole answer left the Worker. If the client still timed out, the loss is after the Worker. |
+| `client went away after N bytes` | The client hung up (usually its own timeout) while data was still being sent. |
+| `-> 4xx/5xx` plus `mcp upstream NNN body: ...` | GitHub refused the call; the body says why. |
+| `upstream unreachable` | The Worker could not reach GitHub. |
+
+Set `UPSTREAM_TIMEOUT_MS` to change how long the Worker waits for GitHub to start answering (default 40000).
 
 The proxy never hands the client a link to GitHub's API host: redirects are followed inside the Worker, and URLs in
 `Location`, `Link` and `WWW-Authenticate` headers are rewritten to the proxy's own address, so a client that can only
