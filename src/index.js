@@ -22,6 +22,9 @@ const UPSTREAM_ORIGIN = UPSTREAM_PUBLIC; // where requests are sent
 const MAX_UPSTREAM_REDIRECTS = 5;
 // How long to wait for GitHub to START answering (headers). Streaming bodies are not cut off.
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 40000;
+// tools/list answers are big and compress ~6:1, but event streams are not compressed by default.
+const COMPRESS_MIN_BYTES = 8192;
+const COMPRESS_WAIT_MS = 20000;
 const GITHUB_UA = 'github-mcp-proxy';
 
 // Scopes this proxy hands to MCP clients.
@@ -363,6 +366,102 @@ function rpcMethod(buf) {
   }
 }
 
+// Cloudflare normalizes the Accept-Encoding header the Worker sees; the client's own value is in
+// request.cf.clientAcceptEncoding, so prefer that.
+function clientAcceptsGzip(request) {
+  const original = request.cf?.clientAcceptEncoding ?? request.headers.get('Accept-Encoding') ?? '';
+  return /\bgzip\b/i.test(original);
+}
+
+// id of a single JSON-RPC request body (null if it is not one).
+function rpcId(buf) {
+  if (!buf || buf.byteLength === 0 || buf.byteLength > 1_000_000) return null;
+  try {
+    const j = JSON.parse(new TextDecoder().decode(buf));
+    return j && !Array.isArray(j) && 'id' in j ? j.id : null;
+  } catch {
+    return null;
+  }
+}
+
+// True once the text holds a complete SSE event carrying the JSON-RPC answer for `id`.
+function answerSeen(text, id) {
+  const events = text.split(/\r?\n\r?\n/);
+  events.pop(); // the last piece is incomplete (or empty)
+  for (const ev of events) {
+    const data = ev
+      .split(/\r?\n/)
+      .filter((l) => l.startsWith('data:'))
+      .map((l) => l.slice(5).replace(/^ /, ''))
+      .join('\n');
+    if (!data) continue;
+    try {
+      const m = JSON.parse(data);
+      if (m && m.id === id && ('result' in m || 'error' in m)) return true;
+    } catch {
+      // not JSON: ignore
+    }
+  }
+  return false;
+}
+
+// Stream that replays what was already read, then carries on with the rest.
+function replayStream(chunks, pending, reader) {
+  let i = 0;
+  return new ReadableStream(
+    {
+      async pull(controller) {
+        if (i < chunks.length) return controller.enqueue(chunks[i++]);
+        const r = pending ? await pending : await reader.read();
+        pending = null;
+        if (r.done) controller.close();
+        else controller.enqueue(r.value);
+      },
+      cancel(reason) {
+        return reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 }
+  );
+}
+
+// Reads a single-answer event stream (tools/list) completely and returns it gzip-compressed.
+// If the answer does not finish in time, returns the original stream untouched instead.
+async function gzipSingleAnswer(body, id) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const chunks = [];
+  let text = '';
+  let bytes = 0;
+  let complete = false;
+  let pending = null;
+  const deadline = Date.now() + COMPRESS_WAIT_MS;
+  const TIMEOUT = Symbol('timeout');
+  while (!complete) {
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    pending = pending || reader.read();
+    let timer;
+    const r = await Promise.race([pending, new Promise((res) => { timer = setTimeout(() => res(TIMEOUT), left); })]);
+    clearTimeout(timer);
+    if (r === TIMEOUT) break;
+    pending = null;
+    if (r.done) { complete = true; break; }
+    chunks.push(r.value);
+    bytes += r.value.byteLength;
+    text += decoder.decode(r.value, { stream: true });
+    if (answerSeen(text, id)) {
+      complete = true;
+      reader.cancel().catch(() => {}); // the answer is complete; don't wait for the server to close
+    }
+  }
+  if (!complete) return { stream: replayStream(chunks, pending, reader) };
+  const raw = new Blob(chunks);
+  if (bytes < COMPRESS_MIN_BYTES) return { raw: await raw.arrayBuffer(), bytes };
+  const gz = await new Response(raw.stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+  return { gz, bytes };
+}
+
 // Authenticated download test used by test/probe.mjs: returns N bytes of incompressible-ish
 // text without contacting GitHub, so a network problem can be told apart from an MCP problem.
 const SELFTEST_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -526,6 +625,33 @@ const mcpApiHandler = {
         console.warn('GitHub scope challenge:', challenge);
         responseHeaders.delete('WWW-Authenticate');
       }
+    }
+
+    // Event streams are not compressed by default, and the tool list is large. When GitHub did not
+    // compress it and the client accepts gzip, send it compressed (COMPRESS_LISTS=false turns this off).
+    if (
+      env.COMPRESS_LISTS !== 'false' && rpc === 'tools/list' && upstream.status === 200 && upstream.body &&
+      contentType.includes('text/event-stream') && !upstream.headers.get('Content-Encoding') &&
+      clientAcceptsGzip(request)
+    ) {
+      const out = await gzipSingleAnswer(upstream.body, rpcId(bodyBuf));
+      if (out.stream) {
+        console.warn(`${label} answer did not finish within ${COMPRESS_WAIT_MS}ms; sending it uncompressed`);
+        return new Response(countedBody(out.stream, label, started), {
+          status: upstream.status, statusText: upstream.statusText, headers: responseHeaders,
+        });
+      }
+      responseHeaders.delete('Content-Length');
+      if (out.gz) {
+        responseHeaders.set('Content-Encoding', 'gzip');
+        responseHeaders.append('Vary', 'Accept-Encoding');
+        console.log(`${label} compressed answer: ${out.bytes} -> ${out.gz.byteLength} bytes (${Date.now() - started}ms)`);
+        return new Response(out.gz, {
+          status: upstream.status, statusText: upstream.statusText, headers: responseHeaders, encodeBody: 'manual',
+        });
+      }
+      console.log(`${label} answer is small (${out.bytes} bytes), not compressed`);
+      return new Response(out.raw, { status: upstream.status, statusText: upstream.statusText, headers: responseHeaders });
     }
 
     return new Response(countedBody(upstream.body, label, started), {

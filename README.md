@@ -112,6 +112,7 @@ so you can copy the right value.
 | `READ_ONLY` | `true` = no client can get write access. |
 | `ALLOWED_GITHUB_USERS` | Comma-separated GitHub logins allowed to authorize. Empty = anyone. **Recommended for personal deployments.** |
 | `GITHUB_READONLY_SCOPES` | Scopes requested in read-only mode. Default: `read:org read:user user:email read:packages read:project` (no `repo`). |
+| `COMPRESS_LISTS` | `false` turns off gzip for `tools/list` answers (default: on). |
 | `MCP_TOOLSETS` | Default `X-MCP-Toolsets` sent to GitHub (e.g. `repos,issues,pull_requests`) when the client sends none. A smaller tool list means a much smaller `tools/list` answer. |
 | `UPSTREAM_TIMEOUT_MS` | How long to wait for GitHub to start answering before returning 504 (default 40000). |
 | `GITHUB_SCOPES` | Space-separated scopes requested from GitHub. Defaults to GitHub's own default set. Add e.g. `workflow` if you see scope challenges in the logs. |
@@ -165,6 +166,15 @@ the way back to the client. `npm run probe` then runs a **download test** automa
 it fetches generated data of growing size from `/mcp/__selftest` (needs your sign-in; served by the Worker itself,
 GitHub is not involved), once as an event stream and once as JSON, and says whether big responses stall, at what
 size, and whether event streams are treated differently from JSON.
+
+**Compression.** `tools/list` answers are large and event streams are not compressed by default, so the Worker
+gzips that one answer when (a) GitHub did not compress it, (b) the client's own `Accept-Encoding` includes gzip, and
+(c) the answer is at least 8 KB. It reads the single answer, compresses it and sends it with `Content-Encoding: gzip`;
+if the answer does not finish within 20 s it sends the original stream untouched. The log line reads
+`compressed answer: 126939 -> N bytes`. Disable with `COMPRESS_LISTS=false`.
+
+Find a toolset combination that works from your network with
+`npm run probe -- https://<your-domain>/mcp --toolsets repos,issues,pull_requests` (it prints tool count and size).
 
 Workarounds that need no code: connect through a narrower address such as `https://<your-domain>/mcp/x/issues`
 (or `/mcp/x/repos`, `/mcp/readonly`), or set `MCP_TOOLSETS`. GitHub then sends far fewer tools, so the answer is a
