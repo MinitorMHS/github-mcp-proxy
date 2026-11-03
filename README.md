@@ -112,6 +112,7 @@ so you can copy the right value.
 | `READ_ONLY` | `true` = no client can get write access. |
 | `ALLOWED_GITHUB_USERS` | Comma-separated GitHub logins allowed to authorize. Empty = anyone. **Recommended for personal deployments.** |
 | `GITHUB_READONLY_SCOPES` | Scopes requested in read-only mode. Default: `read:org read:user user:email read:packages read:project` (no `repo`). |
+| `MCP_TOOLSETS` | Default `X-MCP-Toolsets` sent to GitHub (e.g. `repos,issues,pull_requests`) when the client sends none. A smaller tool list means a much smaller `tools/list` answer. |
 | `UPSTREAM_TIMEOUT_MS` | How long to wait for GitHub to start answering before returning 504 (default 40000). |
 | `GITHUB_SCOPES` | Space-separated scopes requested from GitHub. Defaults to GitHub's own default set. Add e.g. `workflow` if you see scope challenges in the logs. |
 | `MCP_LOCKDOWN` | `true` sends `X-MCP-Lockdown: true` (hides public issue content from users without push access). |
@@ -156,6 +157,18 @@ mcp upstream 403 body: {"message": ...}
 | `upstream unreachable` | The Worker could not reach GitHub. |
 
 Set `UPSTREAM_TIMEOUT_MS` to change how long the Worker waits for GitHub to start answering (default 40000).
+
+### When the answer leaves the Worker but never arrives
+
+If the logs show `body complete` (the whole answer left the Worker) and the client still times out, the loss is on
+the way back to the client. `npm run probe` then runs a **download test** automatically (`--net` runs it always):
+it fetches generated data of growing size from `/mcp/__selftest` (needs your sign-in; served by the Worker itself,
+GitHub is not involved), once as an event stream and once as JSON, and says whether big responses stall, at what
+size, and whether event streams are treated differently from JSON.
+
+Workarounds that need no code: connect through a narrower address such as `https://<your-domain>/mcp/x/issues`
+(or `/mcp/x/repos`, `/mcp/readonly`), or set `MCP_TOOLSETS`. GitHub then sends far fewer tools, so the answer is a
+fraction of the size (and the model reads fewer tokens).
 
 The proxy never hands the client a link to GitHub's API host: redirects are followed inside the Worker, and URLs in
 `Location`, `Link` and `WWW-Authenticate` headers are rewritten to the proxy's own address, so a client that can only
