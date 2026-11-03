@@ -24,6 +24,13 @@ const MAX_UPSTREAM_REDIRECTS = 5;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 40000;
 // tools/list answers are big and compress ~6:1, but event streams are not compressed by default.
 const COMPRESS_MIN_BYTES = 8192;
+const COMPRESS_MAX_BYTES = 1_000_000; // above this, send as is (keeps CPU time per request low)
+const BUFFER_MAX_BYTES = 8_000_000; // stop buffering beyond this and just stream
+// Plain request/response methods whose answer is one finished message.
+const COMPRESSIBLE_METHODS = new Set([
+  'tools/list', 'tools/call', 'resources/list', 'resources/read',
+  'resources/templates/list', 'prompts/list', 'prompts/get',
+]);
 const COMPRESS_WAIT_MS = 20000;
 const GITHUB_UA = 'github-mcp-proxy';
 
@@ -366,11 +373,16 @@ function rpcMethod(buf) {
   }
 }
 
+// Whether the tools/list answer may be sent gzip-compressed to this client.
 // Cloudflare normalizes the Accept-Encoding header the Worker sees; the client's own value is in
-// request.cf.clientAcceptEncoding, so prefer that.
-function clientAcceptsGzip(request) {
+// request.cf.clientAcceptEncoding, so prefer that. Claude Code sends `Accept-Encoding: identity` on
+// purpose, but its fetch-based HTTP stack decodes a gzip response anyway (tested), so it is allowed.
+// COMPRESS_LISTS=always compresses for every client regardless of what it asked for.
+function clientAcceptsGzip(request, env) {
   const original = request.cf?.clientAcceptEncoding ?? request.headers.get('Accept-Encoding') ?? '';
-  return /\bgzip\b/i.test(original);
+  if (/\bgzip\b/i.test(original)) return true;
+  if (env.COMPRESS_LISTS === 'always') return true;
+  return /^claude-code\//i.test(request.headers.get('User-Agent') || '');
 }
 
 // id of a single JSON-RPC request body (null if it is not one).
@@ -425,7 +437,7 @@ function replayStream(chunks, pending, reader) {
   );
 }
 
-// Reads a single-answer event stream (tools/list) completely and returns it gzip-compressed.
+// Reads a single-answer event stream (tools/list, tools/call, ...) completely and returns it gzip-compressed.
 // If the answer does not finish in time, returns the original stream untouched instead.
 async function gzipSingleAnswer(body, id) {
   const reader = body.getReader();
@@ -449,6 +461,7 @@ async function gzipSingleAnswer(body, id) {
     if (r.done) { complete = true; break; }
     chunks.push(r.value);
     bytes += r.value.byteLength;
+    if (bytes > BUFFER_MAX_BYTES) break; // too big to hold: stream the rest instead
     text += decoder.decode(r.value, { stream: true });
     if (answerSeen(text, id)) {
       complete = true;
@@ -457,7 +470,7 @@ async function gzipSingleAnswer(body, id) {
   }
   if (!complete) return { stream: replayStream(chunks, pending, reader) };
   const raw = new Blob(chunks);
-  if (bytes < COMPRESS_MIN_BYTES) return { raw: await raw.arrayBuffer(), bytes };
+  if (bytes < COMPRESS_MIN_BYTES || bytes > COMPRESS_MAX_BYTES) return { raw: await raw.arrayBuffer(), bytes };
   const gz = await new Response(raw.stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
   return { gz, bytes };
 }
@@ -544,7 +557,8 @@ const mcpApiHandler = {
     const rpc = rpcMethod(bodyBuf);
 
     const label = `mcp ${request.method} ${url.pathname} rpc=${rpc}`;
-    console.log(`${label} -> sent to GitHub`);
+    const clientInfo = `${(request.headers.get('User-Agent') || '-').slice(0, 50)}; accept-encoding: ${request.cf?.clientAcceptEncoding ?? request.headers.get('Accept-Encoding') ?? '-'}`;
+    console.log(`${label} -> sent to GitHub (client: ${clientInfo})`);
 
     // Give GitHub a bounded time to start answering; once headers arrive the body streams freely.
     const timeoutMs = Number(env.UPSTREAM_TIMEOUT_MS) || DEFAULT_UPSTREAM_TIMEOUT_MS;
@@ -627,12 +641,12 @@ const mcpApiHandler = {
       }
     }
 
-    // Event streams are not compressed by default, and the tool list is large. When GitHub did not
+    // Event streams are not compressed by default, and tool lists/results can be large. When GitHub did not
     // compress it and the client accepts gzip, send it compressed (COMPRESS_LISTS=false turns this off).
     if (
-      env.COMPRESS_LISTS !== 'false' && rpc === 'tools/list' && upstream.status === 200 && upstream.body &&
+      env.COMPRESS_LISTS !== 'false' && COMPRESSIBLE_METHODS.has(rpc) && upstream.status === 200 && upstream.body &&
       contentType.includes('text/event-stream') && !upstream.headers.get('Content-Encoding') &&
-      clientAcceptsGzip(request)
+      clientAcceptsGzip(request, env)
     ) {
       const out = await gzipSingleAnswer(upstream.body, rpcId(bodyBuf));
       if (out.stream) {
@@ -650,10 +664,13 @@ const mcpApiHandler = {
           status: upstream.status, statusText: upstream.statusText, headers: responseHeaders, encodeBody: 'manual',
         });
       }
-      console.log(`${label} answer is small (${out.bytes} bytes), not compressed`);
+      console.log(`${label} answer not compressed (${out.bytes} bytes: ${out.bytes < COMPRESS_MIN_BYTES ? 'small' : 'over the compression limit'})`);
       return new Response(out.raw, { status: upstream.status, statusText: upstream.statusText, headers: responseHeaders });
     }
 
+    if (COMPRESSIBLE_METHODS.has(rpc) && upstream.status === 200) {
+      console.log(`${label} not compressed (GitHub encoding=${upstream.headers.get('Content-Encoding') ?? 'none'}, client accepts gzip=${clientAcceptsGzip(request, env)}, COMPRESS_LISTS=${env.COMPRESS_LISTS ?? 'default'})`);
+    }
     return new Response(countedBody(upstream.body, label, started), {
       status: upstream.status,
       statusText: upstream.statusText,

@@ -112,7 +112,7 @@ so you can copy the right value.
 | `READ_ONLY` | `true` = no client can get write access. |
 | `ALLOWED_GITHUB_USERS` | Comma-separated GitHub logins allowed to authorize. Empty = anyone. **Recommended for personal deployments.** |
 | `GITHUB_READONLY_SCOPES` | Scopes requested in read-only mode. Default: `read:org read:user user:email read:packages read:project` (no `repo`). |
-| `COMPRESS_LISTS` | `false` turns off gzip for `tools/list` answers (default: on). |
+| `COMPRESS_LISTS` | gzip for answers (see Troubleshooting): default on for clients that accept gzip and for Claude Code; `always` = every client; `false` = off. |
 | `MCP_TOOLSETS` | Default `X-MCP-Toolsets` sent to GitHub (e.g. `repos,issues,pull_requests`) when the client sends none. A smaller tool list means a much smaller `tools/list` answer. |
 | `UPSTREAM_TIMEOUT_MS` | How long to wait for GitHub to start answering before returning 504 (default 40000). |
 | `GITHUB_SCOPES` | Space-separated scopes requested from GitHub. Defaults to GitHub's own default set. Add e.g. `workflow` if you see scope challenges in the logs. |
@@ -167,11 +167,18 @@ it fetches generated data of growing size from `/mcp/__selftest` (needs your sig
 GitHub is not involved), once as an event stream and once as JSON, and says whether big responses stall, at what
 size, and whether event streams are treated differently from JSON.
 
-**Compression.** `tools/list` answers are large and event streams are not compressed by default, so the Worker
-gzips that one answer when (a) GitHub did not compress it, (b) the client's own `Accept-Encoding` includes gzip, and
-(c) the answer is at least 8 KB. It reads the single answer, compresses it and sends it with `Content-Encoding: gzip`;
-if the answer does not finish within 20 s it sends the original stream untouched. The log line reads
-`compressed answer: 126939 -> N bytes`. Disable with `COMPRESS_LISTS=false`.
+**Compression.** Event streams are not compressed by default, and tool lists and tool results can be large, so the
+Worker gzips the single answer to ordinary requests (`tools/list`, `tools/call`, `resources/*`, `prompts/*`) when
+(a) GitHub did not compress it, (b) the client can decode gzip, and (c) the answer is between 8 KB and 1 MB. It
+reads the answer, compresses it and sends it with `Content-Encoding: gzip`; if the answer does not finish within
+20 s (or exceeds 8 MB) it streams the original untouched. The log line reads `compressed answer: 126939 -> N bytes`;
+when it does not compress, `not compressed (...)` says why.
+
+"Can decode gzip" means the client's own `Accept-Encoding` includes gzip. **Claude Code is a special case**: it sends
+`Accept-Encoding: identity` on purpose, but its fetch-based HTTP stack decodes gzip anyway (tested with Claude Code
+2.1.317, which then lists all tools), so clients whose User-Agent starts with `claude-code/` are compressed for too.
+`COMPRESS_LISTS=always` compresses for every client regardless of what it asked for; `COMPRESS_LISTS=false` turns
+compression off.
 
 Find a toolset combination that works from your network with
 `npm run probe -- https://<your-domain>/mcp --toolsets repos,issues,pull_requests` (it prints tool count and size).
