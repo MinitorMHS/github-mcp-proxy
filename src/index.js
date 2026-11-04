@@ -478,7 +478,32 @@ async function gzipSingleAnswer(body, id) {
 // Authenticated download test used by test/probe.mjs: returns N bytes of incompressible-ish
 // text without contacting GitHub, so a network problem can be told apart from an MCP problem.
 const SELFTEST_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-function selfTestResponse(url) {
+const SELFTEST_WORDS = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa'];
+
+// Compressible test data sent already gzipped with a chosen Content-Encoding (gzip or x-gzip) and
+// optionally Cache-Control: no-transform, to see what Cloudflare's edge does to it for clients that
+// say they cannot decode it (test/probe.mjs --edge).
+async function encodedSelfTest(url, encoding) {
+  const asked = parseInt(url.searchParams.get('bytes') || '40000', 10);
+  const total = Math.min(Math.max(Number.isFinite(asked) ? asked : 40000, 1024), 600000);
+  let text = '';
+  while (text.length < total) text += SELFTEST_WORDS[Math.floor(Math.random() * SELFTEST_WORDS.length)] + ' ';
+  text = text.slice(0, total);
+  const gz = await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+  return new Response(gz, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Content-Encoding': encoding,
+      'Cache-Control': url.searchParams.get('nt') === '1' ? 'no-cache, no-transform' : 'no-cache',
+      'X-Selftest-Raw-Bytes': String(text.length),
+    },
+    encodeBody: 'manual',
+  });
+}
+
+async function selfTestResponse(url) {
+  const requested = url.searchParams.get('enc');
+  if (requested === 'gzip' || requested === 'x-gzip') return encodedSelfTest(url, requested);
   const asked = parseInt(url.searchParams.get('bytes') || '1024', 10);
   const total = Math.min(Math.max(Number.isFinite(asked) ? asked : 1024, 64), 600000);
   const json = url.searchParams.get('type') === 'json';
@@ -521,7 +546,7 @@ const mcpApiHandler = {
     }
 
     const self = new URL(request.url);
-    if (request.method === 'GET' && self.pathname === `${MCP_PATH}/__selftest`) return selfTestResponse(self);
+    if (request.method === 'GET' && self.pathname === `${MCP_PATH}/__selftest`) return await selfTestResponse(self);
 
     let upstreamToken;
     try {

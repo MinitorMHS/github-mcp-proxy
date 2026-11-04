@@ -180,6 +180,20 @@ when it does not compress, `not compressed (...)` says why.
 `COMPRESS_LISTS=always` compresses for every client regardless of what it asked for; `COMPRESS_LISTS=false` turns
 compression off.
 
+**Claude Code and `Accept-Encoding: identity`.** Claude Code asks every server for uncompressed answers. The Worker
+compresses for it anyway, but Cloudflare's edge sits between the Worker and the client and may undo that for a client
+that says `identity` (run `npm run probe -- https://<your-domain>/mcp --edge` to see what it does for you). The
+no-code fix is to tell Claude Code to advertise gzip for this server; Claude Code honors a configured header (tested
+with 2.1.317, where the Worker then compresses and Claude Code lists all tools):
+
+```bash
+claude mcp remove github
+claude mcp add --transport http github https://<your-domain>/mcp --header "Accept-Encoding: gzip, deflate, br"
+```
+
+or in `.mcp.json`: `"github": { "type": "http", "url": "https://<your-domain>/mcp", "headers": { "Accept-Encoding": "gzip, deflate, br" } }`.
+Then run `/mcp` in Claude Code and authenticate again.
+
 Find a toolset combination that works from your network with
 `npm run probe -- https://<your-domain>/mcp --toolsets repos,issues,pull_requests` (it prints tool count and size).
 
